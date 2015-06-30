@@ -1,0 +1,5 @@
+SimpleLog.pm:
+============
+0.1: first public version
+0.1a: fix remaining signal handlers not detected when main loop is stopped
+      add debug messages

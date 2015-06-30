@@ -32,7 +32,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.1';
+my $moduleVersion='0.1a';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -177,6 +177,7 @@ sub forkProcess {
       slog('Unable to fork process, child process queue is full',1);
       return 0;
     }else{
+      slog('Queuing new fork request',5);
       push(@queuedProcesses,{type => 'fork', function => $p_processFunction, callback => $p_endCallback});
       return -1;
     }
@@ -200,6 +201,7 @@ sub _forkProcess {
     &{$p_processFunction}();
     exit 0;
   }
+  slog("Forked new process (PID: $childPid)",5);
   if($conf{mode} eq 'internal' || $osIsWindows) {
     $forkedProcesses{$childPid}=$p_endCallback;
   }else{
@@ -283,6 +285,7 @@ sub createWin32Process {
       slog('Unable to create Win32 process, child process queue is full',1);
       return 0;
     }else{
+      slog('Queuing new win32 process',5);
       push(@queuedProcesses,{type => 'win32',
                              applicationPath => $applicationPath,
                              commandParams => $p_commandParams,
@@ -327,6 +330,7 @@ sub _createWin32Process {
     slog("Unable to create Win32 process ($errorMsg)",1);
     return 0;
   }
+  slog('Created new Win32 process (PID: '.$win32Process->GetProcessID().')',5);
   $win32Processes{$win32Process}=$p_endCallback;
   return $win32Process;
 }
@@ -353,8 +357,11 @@ sub _reapForkedProcesses {
   while(my $pid = waitpid(-1,WNOHANG)) {
     last if($pid == -1);
     if(exists $forkedProcesses{$pid}) {
+      slog("End of forked process (PID: $pid), calling callback",5);
       &{$forkedProcesses{$pid}}($pid,$? >> 8,$? & 127,$? & 128);
       delete $forkedProcesses{$pid};
+    }else{
+      slog("End of forked process (PID: $pid) (unknown child process)",5);
     }
   }
 }
@@ -363,7 +370,9 @@ sub _reapWin32Processes {
   foreach my $win32Process (keys %win32Processes) {
     $win32Process->GetExitCode(my $exitCode);
     if($exitCode != Win32::Process::STILL_ACTIVE()) {
-      &{$win32Processes{$win32Process}}($win32Process->GetProcessID(),$exitCode);
+      my $pid=$win32Process->GetProcessID();
+      slog("End of Win32 process (PID: $pid), calling callback",5);
+      &{$win32Processes{$win32Process}}($pid,$exitCode);
       delete $win32Processes{$win32Process};
     }
   }
@@ -395,6 +404,7 @@ sub registerSocket {
   }else{
     $sockets{$socket}=AE::io($socket,0,sub { &{$p_readCallback}($socket); });
   }
+  slog('New socket registered',5);
   return 1;
 }
 
@@ -405,6 +415,7 @@ sub unregisterSocket {
     return 0;
   }
   delete $sockets{$socket};
+  slog('Socket unregistered',5);
   return 1;
 }
 
@@ -429,27 +440,29 @@ sub registerSignal {
     return 0;
   }
   my ($signal,$p_signalCallback)=@_;
-  if(exists $conf{signals}->{$signal}) {
+  if(exists $signals{$signal}) {
     slog('Unable to register signal \"$signal\" in event loop: this signal has already been registered!',2);
     return 0;
   }
   if($conf{mode} eq 'internal') {
     $SIG{$signal}=$p_signalCallback;
-    $conf{signals}->{$signal}=$p_signalCallback;
+    $signals{$signal}=$p_signalCallback;
   }else{
-    $conf{signals}->{$signal}=AE::signal($signal,$p_signalCallback);
+    $signals{$signal}=AE::signal($signal,$p_signalCallback);
   }
+  slog("Signal $signal registered",5);
   return 1;
 }
 
 sub unregisterSignal {
   my $signal=shift;
-  if(! exists $conf{signals}->{$signal}) {
+  if(! exists $signals{$signal}) {
     slog('Unable to unregister signal in event loop: unknown signal!',2);
     return 0;
   }
   $SIG{$signal}='DEFAULT' if($conf{mode} eq 'internal');
-  delete $conf{signals}->{$signal};
+  delete $signals{$signal};
+  slog("Signal $signal unregistered",5);
   return 1;
 }
 
@@ -463,6 +476,7 @@ sub addTimer {
     slog("Unable to add timer \"$name\" in event loop: this timer has already been registered!",2);
     return 0;
   }
+  slog("Adding timer \"$name\" (delay:$delay, interval:$interval)",5);
   if($conf{mode} eq 'internal') {
     $timers{$name}={nextRun => time+$delay, interval => $interval, callback => $p_callback};
   }else{
@@ -477,6 +491,7 @@ sub removeTimer {
     slog("Unable to remove timer \"$name\" from event loop: unknown timer!",2);
     return 0;
   }
+  slog("Removing timer \"$name\"",5);
   delete $timers{$name};
   return 1;
 }
