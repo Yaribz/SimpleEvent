@@ -3,3 +3,5 @@ SimpleLog.pm:
 0.1: first public version
 0.1a: fix remaining signal handlers not detected when main loop is stopped
       add debug messages
+0.1b: support timers callback removing other timers when using internal event model (AnyEvent event model manages this correctly already)
+      remove non-repeating timers before calling the callbacks (this allows the callback to re-add a timer with same name)

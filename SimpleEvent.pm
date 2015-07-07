@@ -32,7 +32,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.1a';
+my $moduleVersion='0.1b';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -68,7 +68,7 @@ sub init {
     if(any {$param eq $_} (keys %conf)) {
       $conf{$param}=$params{$param};
     }else{
-      slog("Ignoring invalid constructor parameter ($param)",2)
+      slog("Ignoring invalid initialization parameter ($param)",2)
     }
   }
 
@@ -480,7 +480,7 @@ sub addTimer {
   if($conf{mode} eq 'internal') {
     $timers{$name}={nextRun => time+$delay, interval => $interval, callback => $p_callback};
   }else{
-    $timers{$name}=AE::timer($delay,$interval,sub { &{$p_callback}(); removeTimer($name) unless($interval); });
+    $timers{$name}=AE::timer($delay,$interval,sub { removeTimer($name) unless($interval); &{$p_callback}(); });
   }
   return 1;
 }
@@ -498,14 +498,15 @@ sub removeTimer {
 
 sub _checkSimpleTimers {
   foreach my $timerName (keys %timers) {
+    next unless(exists $timers{$timerName}); # timers callbacks can remove other timers!
     if(time >= $timers{$timerName}->{nextRun}) {
-      &{$timers{$timerName}->{callback}}();
-      if(exists $timers{$timerName}) {
-        if($timers{$timerName}->{interval}) {
-          $timers{$timerName}->{nextRun}=time+$timers{$timerName}->{interval};
-        }else{
-          removeTimer($timerName);
-        }
+      if($timers{$timerName}->{interval}) {
+        $timers{$timerName}->{nextRun}=time+$timers{$timerName}->{interval};
+        &{$timers{$timerName}->{callback}}();
+      }else{
+        my $p_timerCallback=$timers{$timerName}->{callback};
+        removeTimer($timerName);
+        &{$p_timerCallback}();
       }
     }
   }
