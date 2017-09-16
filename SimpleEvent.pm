@@ -32,7 +32,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.1b';
+my $moduleVersion='0.1c';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -227,6 +227,7 @@ sub forkCall {
   }
   shutdown($inSocket, 0);
   shutdown($outSocket, 1);
+  my ($readResultStatus,$readResultData)=(-1);
   my $forkResult = forkProcess(
     sub {
       close($outSocket);
@@ -237,34 +238,65 @@ sub forkCall {
       exit 0;
     },
     sub {
-      close($inSocket);
-      my $freezedCallResult;
-      my ($readData,$readLength);
-      while(my @canRead=IO::Select->new($outSocket)->can_read(0)) {
-        $readLength=$outSocket->sysread($readData,POSIX::BUFSIZ);
-        if(! defined $readLength) {
-          my $E="$!";
-          slog("Unable to read data from socketpair, $E",1);
-          $freezedCallResult=freeze([$E]);
-          last;
-        }
-        last if($readLength == 0);
-        $freezedCallResult.=$readData;
+      if(! $readResultStatus) {
+        $p_endCallback->();
+        return;
       }
-      close($outSocket);
-      my $callResult = eval { thaw($freezedCallResult); };
-      $callResult//=[$@];
-      $@=shift(@{$callResult});
+      if($readResultStatus != 2) {
+        my ($readStatus,$readResult)=_readSocketNonBlocking($outSocket);
+        $readResultStatus=$readStatus;
+        unregisterSocket($outSocket);
+        close($outSocket);
+        if(! $readStatus) {
+          slog("Unable to read data from socketpair, $readResult",1);
+          $p_endCallback->();
+          return;
+        }
+      }
+      slog('Socket pair not closed after forked call!',2) unless($readResultStatus == 2);
+      my $r_callResult = eval { thaw($readResultData); };
+      $r_callResult//=[$@];
+      $@=shift(@{$r_callResult});
       slog("Error in forked call, $@",1) if($@);
-      &{$p_endCallback}(@{$callResult});
+      $p_endCallback->(@{$r_callResult});
     },
     $preventQueuing );
+  close($inSocket);
   if(! $forkResult) {
     slog('Unable to fork function call, error in forkProcess()',1);
-    close($inSocket);
     close($outSocket);
+  }else{
+    my $regSockRes=registerSocket($outSocket,
+                                  sub {
+                                    my ($readStatus,$readResult)=_readSocketNonBlocking($outSocket);
+                                    $readResultStatus=$readStatus;
+                                    if(! $readStatus) {
+                                      unregisterSocket($outSocket);
+                                      close($outSocket);
+                                      slog("Unable to read data from socketpair, $readResult",1);
+                                    }else{
+                                      $readResultData.=$readResult;
+                                      if($readStatus == 2) {
+                                        unregisterSocket($outSocket);
+                                        close($outSocket);
+                                      }
+                                    }
+                                  });
+    slog('Unable to register socket for forked function call, error in registerSocket()',1) unless($regSockRes);
   }
   return $forkResult;
+}
+
+sub _readSocketNonBlocking {
+  my $socket=shift;
+  my $result='';
+  while(my @canRead=IO::Select->new($socket)->can_read(0)) {
+    my $readLength=$socket->sysread(my $readData,POSIX::BUFSIZ);
+    return (0,$!) unless(defined $readLength);
+    return (2,$result) unless($readLength);
+    $result.=$readData;
+  }
+  return (1,$result);
 }
 
 sub createWin32Process {
