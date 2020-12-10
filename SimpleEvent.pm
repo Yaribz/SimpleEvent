@@ -22,6 +22,7 @@ package SimpleEvent;
 use strict;
 use warnings;
 
+use File::Spec::Functions qw'devnull';
 use IO::Select;
 use List::Util 'first';
 use POSIX qw':sys_wait_h';
@@ -32,7 +33,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.1c';
+my $moduleVersion='0.2';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -375,6 +376,83 @@ sub _escapeWin32Parameter {
     $arg = "\"$arg\"";
   }
   return $arg;
+}
+
+sub closeAllUserFds {
+  if(! $osIsWindows) {
+    my $devFdFh;
+    if(opendir($devFdFh,'/dev/fd') || opendir($devFdFh,'/proc/self/fd')) {
+      my @fds = sort { $a <=> $b } (grep {/^\d+$/} readdir($devFdFh));
+      if(@fds < 20 || "@fds" ne join(' ', 0..$#fds)) {
+        foreach my $fd (@fds) {
+          POSIX::close($fd) if($fd > $^F);
+        }
+        return;
+      }
+    }
+  }
+  my $maxFd = eval {POSIX::sysconf(POSIX::_SC_OPEN_MAX()) -1} // 1023;
+  for my $fd (($^F+1)..$maxFd) {
+    POSIX::close($fd);
+  }
+}
+
+sub createDetachedProcess {
+  my ($applicationPath,$p_commandParams,$workingDirectory,$createNewConsole)=@_;
+  if($osIsWindows) {
+    my $createFlag = $createNewConsole ? Win32::Process::CREATE_NEW_CONSOLE() : Win32::Process::DETACHED_PROCESS();
+    my $win32ProcCreateRes = Win32::Process::Create(my $win32Process,
+                                                    $applicationPath,
+                                                    join(' ',map {_escapeWin32Parameter($_)} ($applicationPath,@{$p_commandParams})),
+                                                    0,
+                                                    $createFlag,
+                                                    $workingDirectory);
+    if(! $win32ProcCreateRes) {
+      my $errorNb=Win32::GetLastError();
+      my $errorMsg=$errorNb?Win32::FormatMessage($errorNb):'unknown error';
+      $errorMsg=~s/\cM?\cJ$//;
+      slog("Unable to create detached process ($errorMsg)",1);
+      return 0;
+    }
+    slog('Created new detached Win32 process (PID: '.$win32Process->GetProcessID().')',5);
+    return $win32Process;
+  }else{
+    slog('Ignoring new console mode for detached process creation (only supported on Windows system)',2) if($createNewConsole);
+    my $forkRes = forkProcess(
+      sub {
+        if(! POSIX::setsid()) {
+          slog('Unable to call POSIX::setsid() for detached process creation',1);
+          exit 1;
+        }
+        my $childPid = fork();
+        if(! defined $childPid) {
+          slog("Unable to fork process for detached process creation (fork 2), $!",1);
+          exit 2;
+        }
+        exit 0 if($childPid);
+        chdir($workingDirectory);
+        closeAllUserFds();
+        my $nullDevice=devnull();
+        open(STDIN,'<',$nullDevice);
+        open(STDOUT,'>',$nullDevice);
+        open(STDERR,'>',$nullDevice);
+        exec {$applicationPath} ($applicationPath,@{$p_commandParams});
+      },
+      sub {
+        my (undef,$exitCode,$signalNb,$hasCoreDump)=@_;
+        if($exitCode || $signalNb || $hasCoreDump) {
+          slog('Error during detached process creation (first forked process exited abnormally)',1);
+        }
+      },
+      0);
+    if(! $forkRes) {
+      slog("Unable to fork process for detached process creation (fork 1), $!",1);
+      return 0;
+    }else{
+      slog('Created new detached daemon process',5);
+      return 1;
+    }
+  }
 }
 
 sub _manageProcesses {

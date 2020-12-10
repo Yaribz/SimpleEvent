@@ -6,3 +6,5 @@ SimpleLog.pm:
 0.1b: support timers callback removing other timers when using internal event model (AnyEvent event model manages this correctly already)
       remove non-repeating timers before calling the callbacks (this allows the callback to re-add a timer with same name)
 0.1c: fix forkCall not working properly when returned data are bigger than output buffers
+0.2: add function to close all non-system file descriptors (can be useful when the close-on-exec flag is missing)
+     add function to create a new detached/daemon process
