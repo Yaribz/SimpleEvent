@@ -1,7 +1,7 @@
 # A Perl module implementing a basic asynchronous event functionality compatible
 # with AnyEvent
 #
-# Copyright (C) 2008-2015  Yann Riou <yaribzh@gmail.com>
+# Copyright (C) 2008-2020  Yann Riou <yaribzh@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -33,7 +33,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.2';
+my $moduleVersion='0.3';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -533,6 +533,7 @@ sub _checkSimpleSockets {
   if(%sockets) {
     my @pendingSockets=IO::Select->new(keys %sockets)->can_read($conf{timeSlice});
     foreach my $pendingSock (@pendingSockets) {
+      next unless(exists $sockets{$pendingSock}); # sockets can be unregistered by forked process exit callbacks at any time (linux), or by any other socket callback
       &{$sockets{$pendingSock}}($pendingSock);
     }
   }else{
@@ -608,7 +609,7 @@ sub removeTimer {
 
 sub _checkSimpleTimers {
   foreach my $timerName (keys %timers) {
-    next unless(exists $timers{$timerName}); # timers callbacks can remove other timers!
+    next unless(exists $timers{$timerName}); # timers can be removed by forked process exit callbacks at any time (linux), or by any other timer callback
     if(time >= $timers{$timerName}->{nextRun}) {
       if($timers{$timerName}->{interval}) {
         $timers{$timerName}->{nextRun}=time+$timers{$timerName}->{interval};

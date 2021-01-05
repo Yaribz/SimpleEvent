@@ -8,3 +8,4 @@ SimpleEvent.pm:
 0.1c: fix forkCall not working properly when returned data are bigger than output buffers
 0.2: add function to close all non-system file descriptors (can be useful when the close-on-exec flag is missing)
      add function to create a new detached/daemon process
+0.3: fix race condition in socket handlers management when using internal event model
