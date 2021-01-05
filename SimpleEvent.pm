@@ -33,7 +33,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.3';
+my $moduleVersion='0.4';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -226,8 +226,6 @@ sub forkCall {
     slog("Unable to fork function call, cannot create socketpair: $!",1);
     return 0;
   }
-  shutdown($inSocket, 0);
-  shutdown($outSocket, 1);
   my ($readResultStatus,$readResultData)=(-1);
   my $forkResult = forkProcess(
     sub {
@@ -253,6 +251,7 @@ sub forkCall {
           $p_endCallback->();
           return;
         }
+        $readResultData.=$readResult;
       }
       slog('Socket pair not closed after forked call!',2) unless($readResultStatus == 2);
       my $r_callResult = eval { thaw($readResultData); };
@@ -262,7 +261,6 @@ sub forkCall {
       $p_endCallback->(@{$r_callResult});
     },
     $preventQueuing );
-  close($inSocket);
   if(! $forkResult) {
     slog('Unable to fork function call, error in forkProcess()',1);
     close($outSocket);

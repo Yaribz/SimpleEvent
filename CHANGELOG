@@ -9,3 +9,6 @@ SimpleEvent.pm:
 0.2: add function to close all non-system file descriptors (can be useful when the close-on-exec flag is missing)
      add function to create a new detached/daemon process
 0.3: fix race condition in socket handlers management when using internal event model
+0.4: fix forkCall failing to retrieve call result when the fork request is queued
+     fix forkCall failing to retrieve call result when the forked process runs for more than the half-closed socket system timeout
+     fix forkCall failing to retrieve call result when the forked process exits before returned data have been received by the parent process
