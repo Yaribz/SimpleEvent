@@ -12,3 +12,5 @@ SimpleEvent.pm:
 0.4: fix forkCall failing to retrieve call result when the fork request is queued
      fix forkCall failing to retrieve call result when the forked process runs for more than the half-closed socket system timeout
      fix forkCall failing to retrieve call result when the forked process exits before returned data have been received by the parent process
+0.5: timers now properly support subsecond delay and intervals
+     fix buggy console when event loop is stopped while a forked process is still running (Windows)

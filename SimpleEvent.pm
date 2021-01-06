@@ -33,7 +33,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.4';
+my $moduleVersion='0.5';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -198,6 +198,8 @@ sub _forkProcess {
     if($osIsWindows) {
       no warnings 'redefine';
       eval "sub Win32::Process::DESTROY {}";
+      close(STDIN);
+      open(STDIN,'<',devnull());
     }
     &{$p_processFunction}();
     exit 0;
@@ -587,7 +589,7 @@ sub addTimer {
   }
   slog("Adding timer \"$name\" (delay:$delay, interval:$interval)",5);
   if($conf{mode} eq 'internal') {
-    $timers{$name}={nextRun => time+$delay, interval => $interval, callback => $p_callback};
+    $timers{$name}={nextRun => Time::HiRes::time+$delay, interval => $interval, callback => $p_callback};
   }else{
     $timers{$name}=AE::timer($delay,$interval,sub { removeTimer($name) unless($interval); &{$p_callback}(); });
   }
@@ -608,9 +610,9 @@ sub removeTimer {
 sub _checkSimpleTimers {
   foreach my $timerName (keys %timers) {
     next unless(exists $timers{$timerName}); # timers can be removed by forked process exit callbacks at any time (linux), or by any other timer callback
-    if(time >= $timers{$timerName}->{nextRun}) {
+    if(Time::HiRes::time >= $timers{$timerName}->{nextRun}) {
       if($timers{$timerName}->{interval}) {
-        $timers{$timerName}->{nextRun}=time+$timers{$timerName}->{interval};
+        $timers{$timerName}->{nextRun}=Time::HiRes::time+$timers{$timerName}->{interval};
         &{$timers{$timerName}->{callback}}();
       }else{
         my $p_timerCallback=$timers{$timerName}->{callback};
