@@ -33,7 +33,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.5';
+my $moduleVersion='0.6';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -51,6 +51,9 @@ my %forkedProcesses;
 my %win32Processes;
 tie %win32Processes, 'Tie::RefHash';
 my @queuedProcesses;
+my @reapedProcesses;
+my %procHandles;
+my ($procHdlTs,$procHdlNb)=(time,0);
 my %signals;
 my %sockets;
 tie %sockets, 'Tie::RefHash';
@@ -61,6 +64,15 @@ my $osIsWindows=$^O eq 'MSWin32';
 
 sub slog {
   $conf{sLog}->log(@_);
+}
+
+sub hasEvalError {
+  if($@) {
+    chomp($@);
+    return 1;
+  }else{
+    return 0;
+  }
 }
 
 sub init {
@@ -75,7 +87,7 @@ sub init {
 
   if(! defined $conf{mode} || $conf{mode} eq 'AnyEvent') {
     eval "use AnyEvent";
-    if($@) {
+    if(hasEvalError()) {
       if(defined $conf{mode}) {
         slog("Unable to load AnyEvent module: $@",1);
         return 0;
@@ -97,11 +109,24 @@ sub init {
   }
 
   if($conf{mode} eq 'AnyEvent') {
+    if($osIsWindows) {
+      if(exists $::{'EV::'}) {
+        slog('The AnyEvent module cannot be used with the EV library on Windows system',1);
+        return 0;
+      }
+      while(defined (my $eventModelIdx = first {$AnyEvent::models[$_][1] eq 'AnyEvent::Impl::EV'} (0..$#AnyEvent::models))) {
+        splice(@AnyEvent::models,$eventModelIdx,1);
+      }
+    }
     my $anyEventModel=AnyEvent::detect();
-    slog("Event loop initialized using model $anyEventModel",3);
+    slog("Event loop initialized using model $anyEventModel (time slice: ".($conf{timeSlice}*1000).'ms)',3);
+    if($osIsWindows && $anyEventModel eq 'AnyEvent::Impl::EV') {
+      slog('The AnyEvent module cannot be used with the EV library on Windows system',1);
+      return 0;
+    }
     $endLoopCondition=AE::cv();
   }else{
-    slog("Event loop initialized using internal model",3);
+    slog('Event loop initialized using internal model (time slice: '.($conf{timeSlice}*1000).'ms)',3);
     $endLoopCondition=0;
   }
 
@@ -113,6 +138,12 @@ sub getModel {
   return 'internal' if($conf{mode} eq 'internal');
   return AnyEvent::detect();
 }
+
+sub getNbRunningProcesses { return %forkedProcesses + %win32Processes; }
+sub getNbQueuedProcesses { return scalar @queuedProcesses; }
+sub getNbSignals { return scalar %signals; }
+sub getNbSockets { return scalar (keys %sockets); }
+sub getNbTimers { return scalar %timers; }
 
 sub startLoop {
   my $p_cleanUpFunction=shift;
@@ -127,7 +158,9 @@ sub startLoop {
   }else{
     while(! $endLoopCondition) {
       _checkSimpleTimers();
+      last if($endLoopCondition);
       _checkSimpleSockets();
+      last if($endLoopCondition);
       _manageProcesses();
     }
   }
@@ -164,6 +197,17 @@ sub stopLoop {
   return 1;
 }
 
+sub getNewProcessHandle {
+  my $currentTs=time;
+  if($currentTs>$procHdlTs) {
+    $procHdlTs=$currentTs;
+    $procHdlNb=1;
+  }else{
+    $procHdlNb++;
+  }
+  return "$procHdlTs#$procHdlNb";
+}
+
 sub forkProcess {
   if(! defined $endLoopCondition) {
     slog('Unable to fork process, event loop is uninitialized',1);
@@ -178,19 +222,28 @@ sub forkProcess {
       slog('Unable to fork process, child process queue is full',1);
       return 0;
     }else{
-      slog('Queuing new fork request',5);
-      push(@queuedProcesses,{type => 'fork', function => $p_processFunction, callback => $p_endCallback});
-      return -1;
+      my $procHandle=getNewProcessHandle();
+      slog("Queuing new fork request [$procHandle]",5);
+      push(@queuedProcesses,{type => 'fork', function => $p_processFunction, callback => $p_endCallback, procHandle => $procHandle});
+      $procHandles{$procHandle}=['queued'];
+      return wantarray() ? (-1,$procHandle) : -1;
     }
   }
   return _forkProcess($p_processFunction,$p_endCallback);
 }
 
 sub _forkProcess {
-  my ($p_processFunction,$p_endCallback)=@_;
+  my ($p_processFunction,$p_endCallback,$procHandle)=@_;
   my $childPid = fork();
   if(! defined $childPid) {
     slog("Unable to fork process, $!",1);
+    if(defined $procHandle) {
+      if(defined $procHandles{$procHandle}[2]) {
+        my $forkCallSocket=$procHandles{$procHandle}[2];
+        unregisterSocket($forkCallSocket) if(exists $sockets{$forkCallSocket});
+      }
+      delete $procHandles{$procHandle};
+    }
     return 0;
   }
   if($childPid == 0) {
@@ -201,20 +254,38 @@ sub _forkProcess {
       close(STDIN);
       open(STDIN,'<',devnull());
     }
+    %forkedProcesses=();
+    %win32Processes=();
+    @queuedProcesses=();
+    @reapedProcesses=();
+    %procHandles=();
+    %signals=();
+    %sockets=();
+    %timers=();
     &{$p_processFunction}();
     exit 0;
   }
-  slog("Forked new process (PID: $childPid)",5);
+  if(defined $procHandle) {
+    $procHandles{$procHandle}[0]='forked';
+    $procHandles{$procHandle}[1]=$childPid;
+  }else{
+    $procHandle=getNewProcessHandle();
+    $procHandles{$procHandle}=['forked',$childPid];
+  }
+  slog("Forked new process (PID: $childPid) [$procHandle]",5);
   if($conf{mode} eq 'internal' || $osIsWindows) {
-    $forkedProcesses{$childPid}=$p_endCallback;
+    $forkedProcesses{$childPid}=sub { delete $procHandles{$procHandle};
+                                      &{$p_endCallback}(@_); };
   }else{
     $forkedProcesses{$childPid}=AE::child($childPid,
                                           sub {
+                                            slog("End of forked process (PID: $childPid), calling callback",5);
+                                            delete $procHandles{$procHandle};
                                             &{$p_endCallback}($_[0],$_[1] >> 8,$_[1] & 127,$_[1] & 128);
                                             delete $forkedProcesses{$childPid};
                                           } );
   }
-  return $childPid;
+  return wantarray() ? ($childPid,$procHandle) : $childPid;
 }
 
 sub forkCall {
@@ -229,11 +300,11 @@ sub forkCall {
     return 0;
   }
   my ($readResultStatus,$readResultData)=(-1);
-  my $forkResult = forkProcess(
+  my ($forkResult,$procHandle);($forkResult,$procHandle) = forkProcess(
     sub {
       close($outSocket);
       my $callResult = eval { freeze([undef, &{$p_processFunction}()]); };
-      $callResult = freeze(["$@"]) if $@;
+      $callResult = freeze(["$@"]) if($@);
       print $inSocket $callResult;
       close($inSocket);
       exit 0;
@@ -249,22 +320,23 @@ sub forkCall {
         unregisterSocket($outSocket);
         close($outSocket);
         if(! $readStatus) {
-          slog("Unable to read data from socketpair, $readResult",1);
+          slog("Unable to read data from socketpair [$procHandle], $readResult",1);
           $p_endCallback->();
           return;
         }
         $readResultData.=$readResult;
       }
-      slog('Socket pair not closed after forked call!',2) unless($readResultStatus == 2);
+      slog("Socket pair not closed after forked call! [$procHandle]",2) unless($readResultStatus == 2);
       my $r_callResult = eval { thaw($readResultData); };
       $r_callResult//=[$@];
       $@=shift(@{$r_callResult});
-      slog("Error in forked call, $@",1) if($@);
+      slog("Error in forked call, $@",1) if(hasEvalError());
       $p_endCallback->(@{$r_callResult});
     },
     $preventQueuing );
   if(! $forkResult) {
     slog('Unable to fork function call, error in forkProcess()',1);
+    close($inSocket);
     close($outSocket);
   }else{
     my $regSockRes=registerSocket($outSocket,
@@ -274,7 +346,7 @@ sub forkCall {
                                     if(! $readStatus) {
                                       unregisterSocket($outSocket);
                                       close($outSocket);
-                                      slog("Unable to read data from socketpair, $readResult",1);
+                                      slog("Unable to read data from socketpair [$procHandle], $readResult",1);
                                     }else{
                                       $readResultData.=$readResult;
                                       if($readStatus == 2) {
@@ -283,9 +355,13 @@ sub forkCall {
                                       }
                                     }
                                   });
-    slog('Unable to register socket for forked function call, error in registerSocket()',1) unless($regSockRes);
+    if($regSockRes) {
+      $procHandles{$procHandle}[2]=$outSocket;
+    }else{
+      slog("Unable to register socket for forked function call, error in registerSocket() [$procHandle]",1);
+    }
   }
-  return $forkResult;
+  return wantarray() ? ($forkResult,$procHandle) : $forkResult;
 }
 
 sub _readSocketNonBlocking {
@@ -318,54 +394,130 @@ sub createWin32Process {
       slog('Unable to create Win32 process, child process queue is full',1);
       return 0;
     }else{
-      slog('Queuing new win32 process',5);
+      my $procHandle=getNewProcessHandle();
+      slog("Queuing new Win32 process [$procHandle]",5);
       push(@queuedProcesses,{type => 'win32',
                              applicationPath => $applicationPath,
                              commandParams => $p_commandParams,
                              workingDirectory => $workingDirectory,
                              callback => $p_endCallback,
-                             redirections => $p_stdRedirections});
-      return -1;
+                             redirections => $p_stdRedirections,
+                             procHandle => $procHandle});
+      $procHandles{$procHandle}=['queued'];
+      return wantarray() ? (-1,$procHandle) : -1;
     }
   }
   return _createWin32Process($applicationPath,$p_commandParams,$workingDirectory,$p_endCallback,$p_stdRedirections);
 }
 
 sub _createWin32Process {
-  my ($applicationPath,$p_commandParams,$workingDirectory,$p_endCallback,$p_stdRedirections)=@_;
-  my ($inheritHandles,$previousStdout,$previousStderr)=(0,undef,undef);
+  my ($applicationPath,$p_commandParams,$workingDirectory,$p_endCallback,$p_stdRedirections,$procHandle)=@_;
+  my ($previousStdout,$previousStderr)=(undef,undef);
+  my @cmdRedirs;
   if(defined $p_stdRedirections) {
-    $inheritHandles=1;
-    open($previousStdout,'>&',\*STDOUT);
-    open($previousStderr,'>&',\*STDERR);
     foreach my $p_redirection (@{$p_stdRedirections}) {
       if(lc($p_redirection->[0]) eq 'stdout') {
+        open($previousStdout,'>&',\*STDOUT) unless(defined $previousStdout);
         open(STDOUT,$p_redirection->[1]);
       }elsif(lc($p_redirection->[0]) eq 'stderr') {
+        open($previousStderr,'>&',\*STDERR) unless(defined $previousStderr);
         open(STDERR,$p_redirection->[1]);
+      }elsif(lc($p_redirection->[0]) =~ /^cmdredir(out|err)$/) {
+        if($p_redirection->[1] =~ /^(>>?)\s*(.+)$/) {
+          my ($redirMode,$redirTarget)=($1,$2);
+          $redirMode="2$redirMode" if(lc(substr($p_redirection->[0],-3)) eq 'err');
+          if($redirTarget =~ /^&(1|2|STDOUT|STDERR)$/) {
+            my $aliasNb={STDOUT => 1, STDERR => 2}->{$1}//$1;
+            push(@cmdRedirs,"$redirMode\&$aliasNb");
+          }else{
+            push(@cmdRedirs,$redirMode._escapeWin32Parameter($redirTarget));
+          }
+        }else{
+          slog("Ignoring invalid command line redirection during Win32 process creation \"$p_redirection->[1]\"",2);
+        }
+      }else{
+        slog("Ignoring invalid redirection during Win32 process creation \"$p_redirection->[0]\"",2);
       }
     }
   }
   my $win32ProcCreateRes = Win32::Process::Create(my $win32Process,
                                                   $applicationPath,
-                                                  join(' ',map {_escapeWin32Parameter($_)} ($applicationPath,@{$p_commandParams})),
-                                                  $inheritHandles,
+                                                  join(' ',map {_escapeWin32Parameter($_)} ($applicationPath,@{$p_commandParams}),@cmdRedirs),
+                                                  0,
                                                   0,
                                                   $workingDirectory);
-  if(defined $p_stdRedirections) {
-    open(STDOUT,'>&',$previousStdout);
-    open(STDERR,'>&',$previousStderr);
-  }
+  open(STDOUT,'>&',$previousStdout) if(defined $previousStdout);
+  open(STDERR,'>&',$previousStderr) if(defined $previousStderr);
   if(! $win32ProcCreateRes) {
     my $errorNb=Win32::GetLastError();
     my $errorMsg=$errorNb?Win32::FormatMessage($errorNb):'unknown error';
     $errorMsg=~s/\cM?\cJ$//;
     slog("Unable to create Win32 process ($errorMsg)",1);
+    delete $procHandles{$procHandle} if(defined $procHandle);
     return 0;
   }
-  slog('Created new Win32 process (PID: '.$win32Process->GetProcessID().')',5);
-  $win32Processes{$win32Process}=$p_endCallback;
-  return $win32Process;
+  $procHandle//=getNewProcessHandle();
+  slog('Created new Win32 process (PID: '.$win32Process->GetProcessID().") [$procHandle]",5);
+  $procHandles{$procHandle}=['win32',$win32Process];
+  $win32Processes{$win32Process}=sub { delete $procHandles{$procHandle};
+                                       &{$p_endCallback}(@_); };
+  return wantarray() ? ($win32Process,$procHandle) : $win32Process;
+}
+
+sub removeProcessCallback {
+  my $procHandle=shift;
+  if(! defined $procHandle) {
+    slog('Unable to remove process callback: undefined process handle value',2);
+    return 0;
+  }
+  if(! exists $procHandles{$procHandle}) {
+    slog("Unable to remove process callback: unknown process handle ($procHandle)",2);
+    return 0;
+  }
+  if($procHandles{$procHandle}[0] eq 'queued') {
+    my $queueIdx = first {$procHandle eq $queuedProcesses[$_]{procHandle}} (0..$#queuedProcesses);
+    if(! defined $queueIdx) {
+      slog("Unable to remove callback for queued process: inconsistent process handle ($procHandle)",0);
+      return 0;
+    }
+    splice(@queuedProcesses,$queueIdx,1);
+    if(defined $procHandles{$procHandle}[2]) {
+      my $forkCallSocket=$procHandles{$procHandle}[2];
+      unregisterSocket($forkCallSocket) if(exists $sockets{$forkCallSocket});
+    }
+    delete $procHandles{$procHandle};
+    slog("Removed queued process [$procHandle]",5);
+    return 1;
+  }elsif($procHandles{$procHandle}[0] eq 'forked') {
+    my ($pid,$forkCallSocket)=($procHandles{$procHandle}[1],$procHandles{$procHandle}[2]);
+    if(exists $forkedProcesses{$pid} && defined $forkedProcesses{$pid}) {
+      if($conf{mode} eq 'internal' || $osIsWindows) {
+        $forkedProcesses{$pid}=undef;
+      }else{
+        $forkedProcesses{$pid}=AE::child($pid, sub { slog("End of forked process (PID: $pid), no callback",5);
+                                                     delete $forkedProcesses{$pid}; } );
+      }
+      unregisterSocket($forkCallSocket) if(defined $forkCallSocket && exists $sockets{$forkCallSocket});
+      delete $procHandles{$procHandle};
+      slog("Removed forked process callback for PID $pid [$procHandle]",5);
+      return 1;
+    }
+    slog("Unable to remove forked process callback for PID $pid : inconsistent process handle ($procHandle)",0);
+    return 0;
+  }elsif($procHandles{$procHandle}[0] eq 'win32') {
+    my $win32Process=$procHandles{$procHandle}[1];
+    if(exists $win32Processes{$win32Process}) {
+      $win32Processes{$win32Process}=undef;
+      delete $procHandles{$procHandle};
+      slog('Removed Win32 process callback for PID '.$win32Process->GetProcessID()." [$procHandle]",5);
+      return 1;
+    }
+    slog('Unable to remove Win32 process callback for PID '.$win32Process->GetProcessID()." : inconsistent process handle ($procHandle)",0);
+    return 0;
+  }else{
+    slog("Unable to remove process callback: invalid process handle ($procHandle)",0);
+    return 0;
+  }
 }
 
 sub _escapeWin32Parameter {
@@ -458,7 +610,10 @@ sub createDetachedProcess {
 sub _manageProcesses {
   if($osIsWindows) {
     _reapForkedProcesses();
-    _reapWin32Processes();
+    _handleReapedProcesses();
+    _reapAndHandleWin32Processes();
+  }elsif($conf{mode} eq 'internal') {
+    _handleReapedProcesses();
   }
   _checkQueuedProcesses();
 }
@@ -466,9 +621,20 @@ sub _manageProcesses {
 sub _reapForkedProcesses {
   while(my $pid = waitpid(-1,WNOHANG)) {
     last if($pid == -1);
+    push(@reapedProcesses,[$pid,$?]);
+  }
+}
+
+sub _handleReapedProcesses {
+  while(my $r_reapedProcess=shift(@reapedProcesses)) {
+    my ($pid,$exitCode)=@{$r_reapedProcess};
     if(exists $forkedProcesses{$pid}) {
-      slog("End of forked process (PID: $pid), calling callback",5);
-      &{$forkedProcesses{$pid}}($pid,$? >> 8,$? & 127,$? & 128);
+      if(defined $forkedProcesses{$pid}) {
+        slog("End of forked process (PID: $pid), calling callback",5);
+        &{$forkedProcesses{$pid}}($pid,$exitCode >> 8,$exitCode & 127,$exitCode & 128);
+      }else{
+        slog("End of forked process (PID: $pid), no callback",5);
+      }
       delete $forkedProcesses{$pid};
     }else{
       slog("End of forked process (PID: $pid) (unknown child process)",5);
@@ -476,13 +642,17 @@ sub _reapForkedProcesses {
   }
 }
 
-sub _reapWin32Processes {
+sub _reapAndHandleWin32Processes {
   foreach my $win32Process (keys %win32Processes) {
     $win32Process->GetExitCode(my $exitCode);
     if($exitCode != Win32::Process::STILL_ACTIVE()) {
       my $pid=$win32Process->GetProcessID();
-      slog("End of Win32 process (PID: $pid), calling callback",5);
-      &{$win32Processes{$win32Process}}($pid,$exitCode);
+      if(defined $win32Processes{$win32Process}) {
+        slog("End of Win32 process (PID: $pid), calling callback",5);
+        &{$win32Processes{$win32Process}}($pid,$exitCode);
+      }else{
+        slog("End of Win32 process (PID: $pid), no callback",5);
+      }
       delete $win32Processes{$win32Process};
     }
   }
@@ -492,9 +662,11 @@ sub _checkQueuedProcesses {
   while(@queuedProcesses && $conf{maxChildProcesses} > (keys %forkedProcesses) + (keys %win32Processes)) {
     my $p_queuedProcess=shift(@queuedProcesses);
     if($p_queuedProcess->{type} eq 'fork') {
-      _forkProcess($p_queuedProcess->{function},$p_queuedProcess->{callback});
+      slog("Unqueuing new fork request [$p_queuedProcess->{procHandle}]",5);
+      _forkProcess($p_queuedProcess->{function},$p_queuedProcess->{callback},$p_queuedProcess->{procHandle});
     }else{
-      _createWin32Process($p_queuedProcess->{applicationPath},$p_queuedProcess->{commandParams},$p_queuedProcess->{workingDirectory},$p_queuedProcess->{callback},$p_queuedProcess->{redirections});
+      slog("Unqueuing new Win32 process [$p_queuedProcess->{procHandle}]",5);
+      _createWin32Process($p_queuedProcess->{applicationPath},$p_queuedProcess->{commandParams},$p_queuedProcess->{workingDirectory},$p_queuedProcess->{callback},$p_queuedProcess->{redirections},$p_queuedProcess->{procHandle});
     }
   }
 }
@@ -645,6 +817,18 @@ sub _debug {
     $sep=1;
     print "queuedProcesses:\n";
     print Dumper(\@queuedProcesses);
+  }
+  if(@reapedProcesses) {
+    print +('-' x 40)."\n" if($sep);
+    $sep=1;
+    print "reapedProcesses:\n";
+    print Dumper(\@reapedProcesses);
+  }
+  if(%procHandles) {
+    print +('-' x 40)."\n" if($sep);
+    $sep=1;
+    print "procHandles:\n";
+    print Dumper(\%procHandles);
   }
   if(%signals) {
     print +('-' x 40)."\n" if($sep);

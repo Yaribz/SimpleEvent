@@ -14,3 +14,15 @@ SimpleEvent.pm:
      fix forkCall failing to retrieve call result when the forked process exits before returned data have been received by the parent process
 0.5: timers now properly support subsecond delay and intervals
      fix buggy console when event loop is stopped while a forked process is still running (Windows)
+0.6: the forkProcess, forkCall and createWin32Process functions now also return a handle in addition to the PID
+     add removeProcessCallback function to allow removing the process callbacks added with the forkProcess, forkCall and createWin32Process functions
+     split the process reaping code from the process callback handling code to make the SIGCHLD signal handler safer (Linux)
+     fix handle conflicts in forked processes: internal module data is now flushed at start in forked processes
+     fix handle conflicts in Win32 processes: user handles inheritance is now disabled during Win32 process creation (Windows)
+     add support for cmd.exe style redirections when creating Win32 processes (Windows)
+     the event loop for the internal event model no longer waits for the end of the loop to check if it must be stopped (make the event loop stop faster)
+     prevent using AnyEvent with the EV library on Windows system to avoid crashes (Windows)
+     print time slice value in initialization message
+     add accessors to internal data volumetry indicators
+     fix some errors generating empty line after log message
+     add debug messages when unqueuing processes
