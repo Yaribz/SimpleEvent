@@ -26,3 +26,9 @@ SimpleEvent.pm:
      add accessors to internal data volumetry indicators
      fix some errors generating empty line after log message
      add debug messages when unqueuing processes
+0.7: registered sockets are now automatically closed by default when forking to avoid I/O race conditions
+     new functions: addAutoCloseOnFork/removeAutoCloseOnFork to manage a list of additional handles automatically closed by default when forking
+     the forkProcess and forkCall functions now take an additional parameter to specify a list of handles which should be kept open when forking
+     added workaround for IO::Socket::SSL module misbehaving when forking
+     improved workaround for Win32::Process module not being thread-safe (Windows)
+     fixed getNbRunningProcesses function not taking into account the number of Win32 processes (Windows)

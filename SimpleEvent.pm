@@ -26,6 +26,7 @@ use File::Spec::Functions qw'devnull';
 use IO::Select;
 use List::Util 'first';
 use POSIX qw':sys_wait_h';
+use Scalar::Util;
 use Socket;
 use Storable qw'freeze thaw';
 use Tie::RefHash;
@@ -33,7 +34,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.6';
+my $moduleVersion='0.7';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -48,15 +49,14 @@ my %conf = ( mode => undef,
              sLog => SimpleLog->new(logFiles => [''], logLevels => [4], useANSICodes => [-t STDOUT ? 1 : 0], useTimestamps => [-t STDOUT ? 0 : 1], prefix => "[SimpleEvent] ") );
 
 my %forkedProcesses;
-my %win32Processes;
-tie %win32Processes, 'Tie::RefHash';
+my %win32Processes; tie %win32Processes, 'Tie::RefHash';
 my @queuedProcesses;
 my @reapedProcesses;
 my %procHandles;
 my ($procHdlTs,$procHdlNb)=(time,0);
 my %signals;
-my %sockets;
-tie %sockets, 'Tie::RefHash';
+my %sockets; tie %sockets, 'Tie::RefHash';
+my $r_autoClosedHandles;
 my %timers;
 my $endLoopCondition;
 
@@ -106,6 +106,7 @@ sub init {
   if($osIsWindows) {
     eval "use Win32";
     eval "use Win32::Process";
+    ${Win32::Process::}{CLONE_SKIP}=sub{1}; # Workaround for Win32::Process not being thread-safe
   }
 
   if($conf{mode} eq 'AnyEvent') {
@@ -139,10 +140,10 @@ sub getModel {
   return AnyEvent::detect();
 }
 
-sub getNbRunningProcesses { return %forkedProcesses + %win32Processes; }
+sub getNbRunningProcesses { return %forkedProcesses + scalar(keys %win32Processes); }
 sub getNbQueuedProcesses { return scalar @queuedProcesses; }
 sub getNbSignals { return scalar %signals; }
-sub getNbSockets { return scalar (keys %sockets); }
+sub getNbSockets { return scalar(keys %sockets); }
 sub getNbTimers { return scalar %timers; }
 
 sub startLoop {
@@ -213,7 +214,7 @@ sub forkProcess {
     slog('Unable to fork process, event loop is uninitialized',1);
     return 0;
   }
-  my ($p_processFunction,$p_endCallback,$preventQueuing)=@_;
+  my ($p_processFunction,$p_endCallback,$preventQueuing,$r_keptHandles)=@_;
   if((keys %forkedProcesses) + (keys %win32Processes) >= $conf{maxChildProcesses}) {
     if($preventQueuing) {
       slog("Unable to fork process, maximum number of child process ($conf{maxChildProcesses}) is already running",1);
@@ -224,16 +225,43 @@ sub forkProcess {
     }else{
       my $procHandle=getNewProcessHandle();
       slog("Queuing new fork request [$procHandle]",5);
-      push(@queuedProcesses,{type => 'fork', function => $p_processFunction, callback => $p_endCallback, procHandle => $procHandle});
+      push(@queuedProcesses,{type => 'fork', function => $p_processFunction, callback => $p_endCallback, procHandle => $procHandle, keptHandles => $r_keptHandles});
       $procHandles{$procHandle}=['queued'];
       return wantarray() ? (-1,$procHandle) : -1;
     }
   }
-  return _forkProcess($p_processFunction,$p_endCallback);
+  return _forkProcess($p_processFunction,$p_endCallback,undef,$r_keptHandles);
 }
 
 sub _forkProcess {
-  my ($p_processFunction,$p_endCallback,$procHandle)=@_;
+  my ($p_processFunction,$p_endCallback,$procHandle,$r_keptHandles)=@_;
+  my @autoClosedHandlesForThisFork;
+  {
+    my @autoClosedHandles;
+    foreach my $autoClosedHandle (@{$r_autoClosedHandles}) {
+      if(! defined $autoClosedHandle) {
+        slog('Removing destroyed handle from the auto-close on fork list',5);
+        next;
+      }
+      push(@autoClosedHandles,$autoClosedHandle);
+      Scalar::Util::weaken($autoClosedHandles[-1]);
+      if(ref($autoClosedHandle) eq 'REF') {
+        $autoClosedHandle=$$autoClosedHandle;
+        next unless(defined $autoClosedHandle);
+      }
+      if(none {defined $_ && $autoClosedHandle == $_} @{$r_keptHandles}) {
+        push(@autoClosedHandlesForThisFork,$autoClosedHandle);
+        Scalar::Util::weaken($autoClosedHandlesForThisFork[-1]);
+      }
+    }
+    $r_autoClosedHandles=\@autoClosedHandles;
+    foreach my $registeredSocket (keys %sockets) {
+      next unless(defined $registeredSocket
+                  && (none {defined $_ && $registeredSocket == $_} @{$r_keptHandles}));
+      push(@autoClosedHandlesForThisFork,$registeredSocket);
+      Scalar::Util::weaken($autoClosedHandlesForThisFork[-1]);
+    }
+  }
   my $childPid = fork();
   if(! defined $childPid) {
     slog("Unable to fork process, $!",1);
@@ -248,12 +276,32 @@ sub _forkProcess {
   }
   if($childPid == 0) {
     local $SIG{CHLD};
+
+    # Workaround for IO::Socket::SSL misbehaving with fork()
+    foreach my $r_possibleIoSocketSslHandle (@{$r_autoClosedHandles},keys %sockets) {
+      my ($r_handle,$handleRefType) = ($r_possibleIoSocketSslHandle,ref($r_possibleIoSocketSslHandle));
+      next if($handleRefType eq '');
+      ($r_handle,$handleRefType) = ($$r_handle,ref($$r_handle)) if($handleRefType eq 'REF');
+      ${*$r_handle}{_SimpleEvent_ioSocketSslForkWorkaround}=1 if($handleRefType eq 'IO::Socket::SSL');
+    }
+    if(my $r_stopSslFunc=delete ${IO::Socket::SSL::}{stop_SSL}) {
+      ${IO::Socket::SSL::}{stop_SSL}=sub { my $self=$_[0];
+                                           undef ${*$self}{_SSL_object} if(exists ${*$self}{_SimpleEvent_ioSocketSslForkWorkaround});
+                                           &{$r_stopSslFunc}(@_); };
+    }
+
+    # Workaround for Windows console multiplexing STDIN between threads
     if($osIsWindows) {
-      no warnings 'redefine';
-      eval "sub Win32::Process::DESTROY {}";
       close(STDIN);
       open(STDIN,'<',devnull());
     }
+
+    # Delete shared handles as much as possible to avoid race conditions on I/O
+    map {close($_) if(Scalar::Util::openhandle($_))} @autoClosedHandlesForThisFork;
+
+    # Remove all internal SimpleEvent data related to parent process
+    @autoClosedHandlesForThisFork=();
+    $r_keptHandles=undef;
     %forkedProcesses=();
     %win32Processes=();
     @queuedProcesses=();
@@ -261,8 +309,13 @@ sub _forkProcess {
     %procHandles=();
     %signals=();
     %sockets=();
+    $r_autoClosedHandles=undef;
     %timers=();
+
+    # Call the child process function
     &{$p_processFunction}();
+
+    # Exit if not done yet by the child process function
     exit 0;
   }
   if(defined $procHandle) {
@@ -293,7 +346,7 @@ sub forkCall {
     slog('Unable to fork function call, event loop is uninitialized',1);
     return 0;
   }
-  my ($p_processFunction,$p_endCallback,$preventQueuing)=@_;
+  my ($p_processFunction,$p_endCallback,$preventQueuing,$r_keptHandles)=@_;
   my ($inSocket,$outSocket);
   if(! socketpair($inSocket,$outSocket,AF_UNIX,SOCK_STREAM,PF_UNSPEC)) {
     slog("Unable to fork function call, cannot create socketpair: $!",1);
@@ -333,7 +386,8 @@ sub forkCall {
       slog("Error in forked call, $@",1) if(hasEvalError());
       $p_endCallback->(@{$r_callResult});
     },
-    $preventQueuing );
+    $preventQueuing,
+    $r_keptHandles );
   if(! $forkResult) {
     slog('Unable to fork function call, error in forkProcess()',1);
     close($inSocket);
@@ -663,7 +717,7 @@ sub _checkQueuedProcesses {
     my $p_queuedProcess=shift(@queuedProcesses);
     if($p_queuedProcess->{type} eq 'fork') {
       slog("Unqueuing new fork request [$p_queuedProcess->{procHandle}]",5);
-      _forkProcess($p_queuedProcess->{function},$p_queuedProcess->{callback},$p_queuedProcess->{procHandle});
+      _forkProcess($p_queuedProcess->{function},$p_queuedProcess->{callback},$p_queuedProcess->{procHandle},$p_queuedProcess->{keptHandles});
     }else{
       slog("Unqueuing new Win32 process [$p_queuedProcess->{procHandle}]",5);
       _createWin32Process($p_queuedProcess->{applicationPath},$p_queuedProcess->{commandParams},$p_queuedProcess->{workingDirectory},$p_queuedProcess->{callback},$p_queuedProcess->{redirections},$p_queuedProcess->{procHandle});
@@ -699,6 +753,48 @@ sub unregisterSocket {
   delete $sockets{$socket};
   slog('Socket unregistered',5);
   return 1;
+}
+
+sub addAutoCloseOnFork {
+  my $rc=1;
+  my $nbAdded=0;
+  foreach my $hdl (@_) {
+    my $hdlAddr=Scalar::Util::refaddr($hdl);
+    if(! defined $hdlAddr) {
+      slog('Unable to add handle to the auto-close on fork list: not a reference!',1);
+      $rc=0;
+    }elsif(any {defined $_ && Scalar::Util::refaddr($_) == $hdlAddr} @{$r_autoClosedHandles}) {
+      slog('Unable to add handle to the auto-close on fork list: handle is already added',2);
+      $rc=2 if($rc == 1);
+    }else{
+      push(@{$r_autoClosedHandles},$hdl);
+      Scalar::Util::weaken($r_autoClosedHandles->[-1]);
+      $nbAdded++;
+    }
+  }
+  slog("Added $nbAdded handle".($nbAdded>1?'s':'').' to the auto-close on fork list',5);
+  return $rc;
+}
+
+sub removeAutoCloseOnFork {
+  my $rc=1;
+  my $nbRemoved=0;
+  foreach my $hdl (@_) {
+    my $hdlAddr=Scalar::Util::refaddr($hdl);
+    if(! defined $hdlAddr) {
+      slog('Unable to remove handle from the auto-close on fork list: not a reference!',1);
+      $rc=0;
+    }elsif(defined (my $idx = first {my $r_ach=$r_autoClosedHandles->[$_];
+                                     defined $r_ach && Scalar::Util::refaddr($r_ach) == $hdlAddr} (0..$#{$r_autoClosedHandles}))) {
+      splice(@{$r_autoClosedHandles},$idx,1);
+      $nbRemoved++;
+    }else{
+      slog('Unable to remove handle from the auto-close on fork list: handle is not in current list',2);
+      $rc=2 if($rc == 1);
+    }
+  }
+  slog("Removed $nbRemoved handle".($nbRemoved>1?'s':'').' from the auto-close on fork list',5);
+  return $rc;
 }
 
 sub _checkSimpleSockets {
