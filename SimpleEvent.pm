@@ -34,7 +34,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.7';
+my $moduleVersion='0.8';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -421,7 +421,8 @@ sub forkCall {
 sub _readSocketNonBlocking {
   my $socket=shift;
   my $result='';
-  while(my @canRead=IO::Select->new($socket)->can_read(0)) {
+  my $readSocketSelect=IO::Select->new($socket);
+  while(my @canRead=$readSocketSelect->can_read(0)) {
     my $readLength=$socket->sysread(my $readData,POSIX::BUFSIZ);
     return (0,$!) unless(defined $readLength);
     return (2,$result) unless($readLength);
@@ -753,6 +754,78 @@ sub unregisterSocket {
   delete $sockets{$socket};
   slog('Socket unregistered',5);
   return 1;
+}
+
+sub socketGracefulShutdown {
+  my ($socket,$timeout,$r_callback)=@_;
+  $timeout//=5;
+
+  if(! Scalar::Util::openhandle($socket)) {
+    slog('Unable to perform graceful shutdown on socket: not an open handle',1);
+    return 0;
+  }
+  
+  if(exists $sockets{$socket}) {
+    slog('Unable to perform graceful shutdown on socket: socket is already registered',1);
+    return 0;
+  }
+  
+  if(defined $r_callback && ! defined $endLoopCondition) {
+    slog('Unable to perform asynchronous graceful shutdown on socket: event loop is uninitialized',1);
+    return 0;
+  }
+  
+  my $res=shutdown($socket,1);
+  if(! defined $res) {
+    slog('Unable to perform graceful shutdown on socket: not a valid handle',1);
+    return 0;
+  }elsif(! $res) {
+    slog("Unable to perform graceful shutdown on socket: failed to shutdown socket ($!)",1);
+    return 0;
+  }
+  
+  if(defined $r_callback) {
+    my $timerName='socketGracefulShutdownTimeout#'.Scalar::Util::refaddr($socket);
+    addTimer($timerName,
+             $timeout,
+             0,
+             sub {
+               unregisterSocket($socket);
+               close($socket);
+               $r_callback->(2,'timeout during graceful socket shutdown')
+             });
+    registerSocket($socket,
+                   sub {
+                     my $readLength=$socket->sysread(my $ignored,4096);
+                     return if($readLength);
+                     my ($rc,$warning)=defined $readLength?(1):(2,$!);
+                     unregisterSocket($socket);
+                     removeTimer($timerName);
+                     close($socket);
+                     $r_callback->($rc,$warning);
+                   });
+    return 1;
+  }else{
+    my $timeoutTime=Time::HiRes::time+$timeout;
+    my $nbLingerPackets=0;
+    my $shutdownSel=IO::Select->new($socket);
+    while($nbLingerPackets<10) {
+      my $maxWait=$timeoutTime-Time::HiRes::time;
+      $maxWait=0 if($maxWait < 0);
+      last unless($shutdownSel->can_read($maxWait));
+      my $readLength=$socket->sysread(my $ignored,4096);
+      if($readLength) {
+        $nbLingerPackets++ unless($maxWait);
+        next;
+      }
+      my ($rc,$warning)=defined $readLength?(1):(2,$!);
+      close($socket);
+      return wantarray() ? ($rc,$warning) : $rc;
+    }
+    close($socket);
+    return wantarray() ? (2,'timeout during graceful socket shutdown'):2;
+  }
+  
 }
 
 sub addAutoCloseOnFork {

@@ -32,3 +32,5 @@ SimpleEvent.pm:
      added workaround for IO::Socket::SSL module misbehaving when forking
      improved workaround for Win32::Process module not being thread-safe (Windows)
      fixed getNbRunningProcesses function not taking into account the number of Win32 processes (Windows)
+0.8: add function implementing both synchronous and asynchronous graceful socket shutdown
+     minor optimization in non-blocking socket read
