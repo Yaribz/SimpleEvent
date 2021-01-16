@@ -24,7 +24,7 @@ use warnings;
 
 use File::Spec::Functions qw'devnull';
 use IO::Select;
-use List::Util 'first';
+use List::Util qw'first sum0';
 use POSIX qw':sys_wait_h';
 use Scalar::Util;
 use Socket;
@@ -34,7 +34,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.8';
+my $moduleVersion='0.9';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -59,6 +59,7 @@ my %sockets; tie %sockets, 'Tie::RefHash';
 my $r_autoClosedHandles;
 my %timers;
 my $endLoopCondition;
+my %proxyPackages;
 
 my $osIsWindows=$^O eq 'MSWin32';
 
@@ -174,8 +175,8 @@ sub startLoop {
     my @remainingTimers=keys %timers;
     &{$p_cleanUpFunction}(\@remainingPids,\@remainingWin32Processes,\@queuedProcesses,\@remainingSignals,\@remainingSockets,\@remainingTimers);
   }
-  my ($nbRemainingForkedProcesses,$nbRemainingWin32Processes,$nbQueuedProcesses)=(scalar keys %forkedProcesses,scalar keys %win32Processes,scalar @queuedProcesses);
-  my ($nbRemainingSignals,$nbRemainingSockets,$nbRemainingTimers)=(scalar keys %signals,scalar keys %sockets, scalar keys %timers);
+  my ($nbRemainingForkedProcesses,$nbRemainingWin32Processes,$nbQueuedProcesses)=(scalar keys %forkedProcesses,scalar keys %win32Processes,getNbQueuedProcesses());
+  my ($nbRemainingSignals,$nbRemainingSockets,$nbRemainingTimers)=(getNbSignals(),getNbSockets(),getNbTimers());
   slog("$nbRemainingForkedProcesses forked process".($nbRemainingForkedProcesses>1?'es are':' is').' still running',2) if($nbRemainingForkedProcesses);
   slog("$nbRemainingWin32Processes Win32 process".($nbRemainingWin32Processes>1?'es are':' is').' still running',2) if($nbRemainingWin32Processes);
   slog("$nbQueuedProcesses process".($nbQueuedProcesses>1?'es are':' is').' still queued',2) if($nbQueuedProcesses);
@@ -215,6 +216,7 @@ sub forkProcess {
     return 0;
   }
   my ($p_processFunction,$p_endCallback,$preventQueuing,$r_keptHandles)=@_;
+  my $originPackage=getOriginPackage();
   if((keys %forkedProcesses) + (keys %win32Processes) >= $conf{maxChildProcesses}) {
     if($preventQueuing) {
       slog("Unable to fork process, maximum number of child process ($conf{maxChildProcesses}) is already running",1);
@@ -225,16 +227,16 @@ sub forkProcess {
     }else{
       my $procHandle=getNewProcessHandle();
       slog("Queuing new fork request [$procHandle]",5);
-      push(@queuedProcesses,{type => 'fork', function => $p_processFunction, callback => $p_endCallback, procHandle => $procHandle, keptHandles => $r_keptHandles});
+      push(@queuedProcesses,{type => 'fork', function => $p_processFunction, callback => $p_endCallback, procHandle => $procHandle, keptHandles => $r_keptHandles, originPackage => $originPackage});
       $procHandles{$procHandle}=['queued'];
       return wantarray() ? (-1,$procHandle) : -1;
     }
   }
-  return _forkProcess($p_processFunction,$p_endCallback,undef,$r_keptHandles);
+  return _forkProcess($p_processFunction,$p_endCallback,undef,$r_keptHandles,$originPackage);
 }
 
 sub _forkProcess {
-  my ($p_processFunction,$p_endCallback,$procHandle,$r_keptHandles)=@_;
+  my ($p_processFunction,$p_endCallback,$procHandle,$r_keptHandles,$originPackage)=@_;
   my @autoClosedHandlesForThisFork;
   {
     my @autoClosedHandles;
@@ -327,16 +329,18 @@ sub _forkProcess {
   }
   slog("Forked new process (PID: $childPid) [$procHandle]",5);
   if($conf{mode} eq 'internal' || $osIsWindows) {
-    $forkedProcesses{$childPid}=sub { delete $procHandles{$procHandle};
-                                      &{$p_endCallback}(@_); };
+    $forkedProcesses{$childPid}=[sub { delete $procHandles{$procHandle};
+                                             &{$p_endCallback}(@_); },
+                                 $originPackage];
   }else{
-    $forkedProcesses{$childPid}=AE::child($childPid,
+    $forkedProcesses{$childPid}=[AE::child($childPid,
                                           sub {
                                             slog("End of forked process (PID: $childPid), calling callback",5);
                                             delete $procHandles{$procHandle};
                                             &{$p_endCallback}($_[0],$_[1] >> 8,$_[1] & 127,$_[1] & 128);
                                             delete $forkedProcesses{$childPid};
-                                          } );
+                                           } ),
+                                 $originPackage];
   }
   return wantarray() ? ($childPid,$procHandle) : $childPid;
 }
@@ -441,6 +445,7 @@ sub createWin32Process {
     return 0;
   }
   my ($applicationPath,$p_commandParams,$workingDirectory,$p_endCallback,$p_stdRedirections,$preventQueuing)=@_;
+  my $originPackage=getOriginPackage();
   if((keys %forkedProcesses) + (keys %win32Processes) >= $conf{maxChildProcesses}) {
     if($preventQueuing) {
       slog("Unable to create Win32 process, maximum number of child process ($conf{maxChildProcesses}) is already running",1);
@@ -457,16 +462,17 @@ sub createWin32Process {
                              workingDirectory => $workingDirectory,
                              callback => $p_endCallback,
                              redirections => $p_stdRedirections,
-                             procHandle => $procHandle});
+                             procHandle => $procHandle,
+                             originPackage => $originPackage});
       $procHandles{$procHandle}=['queued'];
       return wantarray() ? (-1,$procHandle) : -1;
     }
   }
-  return _createWin32Process($applicationPath,$p_commandParams,$workingDirectory,$p_endCallback,$p_stdRedirections);
+  return _createWin32Process($applicationPath,$p_commandParams,$workingDirectory,$p_endCallback,$p_stdRedirections,undef,$originPackage);
 }
 
 sub _createWin32Process {
-  my ($applicationPath,$p_commandParams,$workingDirectory,$p_endCallback,$p_stdRedirections,$procHandle)=@_;
+  my ($applicationPath,$p_commandParams,$workingDirectory,$p_endCallback,$p_stdRedirections,$procHandle,$originPackage)=@_;
   my ($previousStdout,$previousStderr)=(undef,undef);
   my @cmdRedirs;
   if(defined $p_stdRedirections) {
@@ -514,8 +520,9 @@ sub _createWin32Process {
   $procHandle//=getNewProcessHandle();
   slog('Created new Win32 process (PID: '.$win32Process->GetProcessID().") [$procHandle]",5);
   $procHandles{$procHandle}=['win32',$win32Process];
-  $win32Processes{$win32Process}=sub { delete $procHandles{$procHandle};
-                                       &{$p_endCallback}(@_); };
+  $win32Processes{$win32Process}=[sub { delete $procHandles{$procHandle};
+                                        &{$p_endCallback}(@_); },
+                                  $originPackage];
   return wantarray() ? ($win32Process,$procHandle) : $win32Process;
 }
 
@@ -549,8 +556,9 @@ sub removeProcessCallback {
       if($conf{mode} eq 'internal' || $osIsWindows) {
         $forkedProcesses{$pid}=undef;
       }else{
-        $forkedProcesses{$pid}=AE::child($pid, sub { slog("End of forked process (PID: $pid), no callback",5);
-                                                     delete $forkedProcesses{$pid}; } );
+        $forkedProcesses{$pid}=[AE::child($pid, sub { slog("End of forked process (PID: $pid), no callback",5);
+                                                      delete $forkedProcesses{$pid}; } ),
+                                __PACKAGE__];
       }
       unregisterSocket($forkCallSocket) if(defined $forkCallSocket && exists $sockets{$forkCallSocket});
       delete $procHandles{$procHandle};
@@ -561,7 +569,7 @@ sub removeProcessCallback {
     return 0;
   }elsif($procHandles{$procHandle}[0] eq 'win32') {
     my $win32Process=$procHandles{$procHandle}[1];
-    if(exists $win32Processes{$win32Process}) {
+    if(exists $win32Processes{$win32Process} && defined $win32Processes{$win32Process}) {
       $win32Processes{$win32Process}=undef;
       delete $procHandles{$procHandle};
       slog('Removed Win32 process callback for PID '.$win32Process->GetProcessID()." [$procHandle]",5);
@@ -686,7 +694,7 @@ sub _handleReapedProcesses {
     if(exists $forkedProcesses{$pid}) {
       if(defined $forkedProcesses{$pid}) {
         slog("End of forked process (PID: $pid), calling callback",5);
-        &{$forkedProcesses{$pid}}($pid,$exitCode >> 8,$exitCode & 127,$exitCode & 128);
+        &{$forkedProcesses{$pid}[0]}($pid,$exitCode >> 8,$exitCode & 127,$exitCode & 128);
       }else{
         slog("End of forked process (PID: $pid), no callback",5);
       }
@@ -704,7 +712,7 @@ sub _reapAndHandleWin32Processes {
       my $pid=$win32Process->GetProcessID();
       if(defined $win32Processes{$win32Process}) {
         slog("End of Win32 process (PID: $pid), calling callback",5);
-        &{$win32Processes{$win32Process}}($pid,$exitCode);
+        &{$win32Processes{$win32Process}[0]}($pid,$exitCode);
       }else{
         slog("End of Win32 process (PID: $pid), no callback",5);
       }
@@ -718,10 +726,10 @@ sub _checkQueuedProcesses {
     my $p_queuedProcess=shift(@queuedProcesses);
     if($p_queuedProcess->{type} eq 'fork') {
       slog("Unqueuing new fork request [$p_queuedProcess->{procHandle}]",5);
-      _forkProcess($p_queuedProcess->{function},$p_queuedProcess->{callback},$p_queuedProcess->{procHandle},$p_queuedProcess->{keptHandles});
+      _forkProcess($p_queuedProcess->{function},$p_queuedProcess->{callback},$p_queuedProcess->{procHandle},$p_queuedProcess->{keptHandles},$p_queuedProcess->{originPackage});
     }else{
       slog("Unqueuing new Win32 process [$p_queuedProcess->{procHandle}]",5);
-      _createWin32Process($p_queuedProcess->{applicationPath},$p_queuedProcess->{commandParams},$p_queuedProcess->{workingDirectory},$p_queuedProcess->{callback},$p_queuedProcess->{redirections},$p_queuedProcess->{procHandle});
+      _createWin32Process($p_queuedProcess->{applicationPath},$p_queuedProcess->{commandParams},$p_queuedProcess->{workingDirectory},$p_queuedProcess->{callback},$p_queuedProcess->{redirections},$p_queuedProcess->{procHandle},$p_queuedProcess->{originPackage});
     }
   }
 }
@@ -736,10 +744,11 @@ sub registerSocket {
     slog('Unable to register socket in event loop: this socket has already been registered!',2);
     return 0;
   }
+  my $originPackage=getOriginPackage();
   if($conf{mode} eq 'internal') {
-    $sockets{$socket}=$p_readCallback;
+    $sockets{$socket}=[$p_readCallback,$originPackage];
   }else{
-    $sockets{$socket}=AE::io($socket,0,sub { &{$p_readCallback}($socket); });
+    $sockets{$socket}=[AE::io($socket,0,sub { &{$p_readCallback}($socket); }),$originPackage];
   }
   slog('New socket registered',5);
   return 1;
@@ -875,7 +884,7 @@ sub _checkSimpleSockets {
     my @pendingSockets=IO::Select->new(keys %sockets)->can_read($conf{timeSlice});
     foreach my $pendingSock (@pendingSockets) {
       next unless(exists $sockets{$pendingSock}); # sockets can be unregistered by forked process exit callbacks at any time (linux), or by any other socket callback
-      &{$sockets{$pendingSock}}($pendingSock);
+      &{$sockets{$pendingSock}[0]}($pendingSock);
     }
   }else{
     Time::HiRes::usleep($conf{timeSlice} * 1_000_000);
@@ -896,11 +905,12 @@ sub registerSignal {
     slog('Unable to register signal \"$signal\" in event loop: this signal has already been registered!',2);
     return 0;
   }
+  my $originPackage=getOriginPackage();
   if($conf{mode} eq 'internal') {
     $SIG{$signal}=$p_signalCallback;
-    $signals{$signal}=$p_signalCallback;
+    $signals{$signal}=[$p_signalCallback,$originPackage];
   }else{
-    $signals{$signal}=AE::signal($signal,$p_signalCallback);
+    $signals{$signal}=[AE::signal($signal,$p_signalCallback),$originPackage];
   }
   slog("Signal $signal registered",5);
   return 1;
@@ -929,10 +939,11 @@ sub addTimer {
     return 0;
   }
   slog("Adding timer \"$name\" (delay:$delay, interval:$interval)",5);
+  my $originPackage=getOriginPackage();
   if($conf{mode} eq 'internal') {
-    $timers{$name}={nextRun => Time::HiRes::time+$delay, interval => $interval, callback => $p_callback};
+    $timers{$name}=[{nextRun => Time::HiRes::time+$delay, interval => $interval, callback => $p_callback},$originPackage];
   }else{
-    $timers{$name}=AE::timer($delay,$interval,sub { removeTimer($name) unless($interval); &{$p_callback}(); });
+    $timers{$name}=[AE::timer($delay,$interval,sub { removeTimer($name) unless($interval); &{$p_callback}(); }),$originPackage];
   }
   return 1;
 }
@@ -951,17 +962,105 @@ sub removeTimer {
 sub _checkSimpleTimers {
   foreach my $timerName (keys %timers) {
     next unless(exists $timers{$timerName}); # timers can be removed by forked process exit callbacks at any time (linux), or by any other timer callback
-    if(Time::HiRes::time >= $timers{$timerName}->{nextRun}) {
-      if($timers{$timerName}->{interval}) {
-        $timers{$timerName}->{nextRun}=Time::HiRes::time+$timers{$timerName}->{interval};
-        &{$timers{$timerName}->{callback}}();
+    if(Time::HiRes::time >= $timers{$timerName}[0]{nextRun}) {
+      if($timers{$timerName}[0]{interval}) {
+        $timers{$timerName}[0]{nextRun}=Time::HiRes::time+$timers{$timerName}[0]{interval};
+        &{$timers{$timerName}[0]{callback}}();
       }else{
-        my $p_timerCallback=$timers{$timerName}->{callback};
+        my $p_timerCallback=$timers{$timerName}[0]{callback};
         removeTimer($timerName);
         &{$p_timerCallback}();
       }
     }
   }
+}
+
+sub addProxyPackage {
+  my $packageName=shift;
+  if(exists $proxyPackages{$packageName}) {
+    slog("Unable to add proxy package \"$packageName\", this package is already declared as proxy package",2);
+    return 0;
+  }else{
+    $proxyPackages{$packageName}=1;
+    return 1;
+  }
+}
+
+sub removeProxyPackage {
+  my $packageName=shift;
+  if(exists $proxyPackages{$packageName}) {
+    delete $proxyPackages{$packageName};
+    return 1;
+  }else{
+    slog("Unable to remove proxy package \"$packageName\", this package is not declared as proxy package",2);
+    return 0;
+  }
+}
+
+my %INTERNAL_CALLBACKS=(forkProcess => { createDetachedProcess => 1 },
+                        registerSocket => { forkCall => 1 });
+my $INTERNAL_PACKAGE_PREFIX=__PACKAGE__.'::';
+my $INTERNAL_PACKAGE_PREFIX_LENGTH=length($INTERNAL_PACKAGE_PREFIX);
+sub isInternalCallback {
+  my ($calledFunc,$callerFunc)=@_;
+  return 0 unless(defined $calledFunc && defined $callerFunc);
+  foreach my $func ($calledFunc,$callerFunc) {
+    return 0 unless(index($func,$INTERNAL_PACKAGE_PREFIX) == 0);
+    substr($func,0,$INTERNAL_PACKAGE_PREFIX_LENGTH,'');
+  }
+  return 1 if(exists $INTERNAL_CALLBACKS{$calledFunc} && exists $INTERNAL_CALLBACKS{$calledFunc}{$callerFunc});
+  return 0;
+}
+
+sub getOriginPackage {
+  return __PACKAGE__ if(isInternalCallback((caller(1))[3],(caller(2))[3]));
+  my $nestLevel=1;
+  while(my $callerPackage=caller($nestLevel++)) {
+    next if($callerPackage eq __PACKAGE__ || exists $proxyPackages{$callerPackage});
+    return $callerPackage;
+  }
+  return '_UNKNWON_';
+}
+
+sub removeAllCallbacks {
+  my ($callbackType,$originPackage)=@_;
+  $originPackage//=getOriginPackage();
+  my @knownCallbackTypes=('processes','signals','sockets','timers');
+  if(defined $callbackType && (none {$callbackType eq $_} @knownCallbackTypes)) {
+    slog("Invalid call to removeAllCallbacks function: unknown callback type \"$callbackType\"",1);
+    return undef;
+  }
+  my @callbackTypes=defined($callbackType)?($callbackType):@knownCallbackTypes;
+  my $nbRemovedCallbacks=0;
+  foreach my $type (@callbackTypes) {
+    if($type eq 'processes') {
+      my @procHandlesToRemove=map {$_->{procHandle}} (grep {$_->{originPackage} eq $originPackage} @queuedProcesses);
+      foreach my $procHandle (keys %procHandles) {
+        if($procHandles{$procHandle}[0] eq 'forked') {
+          my $pid=$procHandles{$procHandle}[1];
+          push(@procHandlesToRemove,$procHandle) if(exists $forkedProcesses{$pid} && defined $forkedProcesses{$pid} && $forkedProcesses{$pid}[1] eq $originPackage);
+        }elsif($procHandles{$procHandle}[0] eq 'win32') {
+          my $win32Process=$procHandles{$procHandle}[1];
+          push(@procHandlesToRemove,$procHandle) if(exists $win32Processes{$win32Process} && defined $win32Processes{$win32Process} && $win32Processes{$win32Process}[1] eq $originPackage);
+        }
+      }
+      my @removeResults=map {removeProcessCallback($_)} @procHandlesToRemove;
+      $nbRemovedCallbacks+=sum0(@removeResults);
+    }elsif($type eq 'signals') {
+      my @signalsToRemove=grep {$signals{$_}[1] eq $originPackage} (keys %signals);
+      my @unregisterResults=map {unregisterSignal($_)} @signalsToRemove;
+      $nbRemovedCallbacks+=sum0(@unregisterResults);
+    }elsif($type eq 'sockets') {
+      my @socketsToRemove=grep {$sockets{$_}[1] eq $originPackage} (keys %sockets);
+      my @unregisterResults=map {unregisterSocket($_)} @socketsToRemove;
+      $nbRemovedCallbacks+=sum0(@unregisterResults);
+    }elsif($type eq 'timers') {
+      my @timersToRemove=grep {$timers{$_}[1] eq $originPackage} (keys %timers);
+      my @removeResults=map {removeTimer($_)} @timersToRemove;
+      $nbRemovedCallbacks+=sum0(@removeResults);
+    }
+  }
+  return $nbRemovedCallbacks;
 }
 
 sub _debug {

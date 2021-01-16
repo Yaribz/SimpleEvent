@@ -34,3 +34,5 @@ SimpleEvent.pm:
      fixed getNbRunningProcesses function not taking into account the number of Win32 processes (Windows)
 0.8: add function implementing both synchronous and asynchronous graceful socket shutdown
      minor optimization in non-blocking socket read
+0.9: enhance callback management to store the origin package of each callback, which makes it possible to remove all the callbacks of a given package automatically
+     allow declaring "proxy" classes for callback management, which are ignored when traversing the call stack to find the origin package
