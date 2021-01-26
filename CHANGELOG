@@ -36,3 +36,8 @@ SimpleEvent.pm:
      minor optimization in non-blocking socket read
 0.9: enhance callback management to store the origin package of each callback, which makes it possible to remove all the callbacks of a given package automatically
      allow declaring "proxy" classes for callback management, which are ignored when traversing the call stack to find the origin package
+0.10: added workaround for Inline::Python module not being thread safe and prevent Python code from calling fork functions on Windows
+      wrap non-code reference callbacks to keep origin information
+      fix sockets registered using file descriptors generating Perl warnings and not being auto-closed on forks
+      support registering/unregistering sockets from non-GLOB objects as long as they implement the "fileno" function (Linux)
+      all sub-packages of proxy packages are now also considered as being proxy packages

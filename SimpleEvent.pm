@@ -34,7 +34,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.9';
+my $moduleVersion='0.10';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -216,7 +216,16 @@ sub forkProcess {
     return 0;
   }
   my ($p_processFunction,$p_endCallback,$preventQueuing,$r_keptHandles)=@_;
+  if($osIsWindows) {
+    my $codeRefType=ref($p_processFunction);
+    if($codeRefType ne 'CODE') {
+      my $reason=$codeRefType eq '' ? 'not a code reference' : "unsupported code reference type: $codeRefType";
+      slog('Unable to fork function call, '.$reason,1);
+      return 0;
+    }
+  }
   my $originPackage=getOriginPackage();
+  $p_endCallback=encapsulateCallback($p_endCallback,$originPackage) unless(ref $p_endCallback eq 'CODE');
   if((keys %forkedProcesses) + (keys %win32Processes) >= $conf{maxChildProcesses}) {
     if($preventQueuing) {
       slog("Unable to fork process, maximum number of child process ($conf{maxChildProcesses}) is already running",1);
@@ -235,6 +244,7 @@ sub forkProcess {
   return _forkProcess($p_processFunction,$p_endCallback,undef,$r_keptHandles,$originPackage);
 }
 
+my $inlinePythonWorkaroundDone;
 sub _forkProcess {
   my ($p_processFunction,$p_endCallback,$procHandle,$r_keptHandles,$originPackage)=@_;
   my @autoClosedHandlesForThisFork;
@@ -261,9 +271,19 @@ sub _forkProcess {
       next unless(defined $registeredSocket
                   && (none {defined $_ && $registeredSocket == $_} @{$r_keptHandles}));
       push(@autoClosedHandlesForThisFork,$registeredSocket);
-      Scalar::Util::weaken($autoClosedHandlesForThisFork[-1]);
+      Scalar::Util::weaken($autoClosedHandlesForThisFork[-1]) if(ref $registeredSocket);
     }
   }
+
+  # Workaround for Inline::Python not being thread safe
+  if(! $inlinePythonWorkaroundDone && ${Inline::Python::}{VERSION}) {
+    ${Inline::Python::Object::}{CLONE_SKIP}=sub {1};
+    ${Inline::Python::Object::Data::}{CLONE_SKIP}=sub {1};
+    ${Inline::Python::Function::}{CLONE_SKIP}=sub {1};
+    ${Inline::Python::Boolean::}{CLONE_SKIP}=sub {1};
+    $inlinePythonWorkaroundDone=1;
+  }
+  
   my $childPid = fork();
   if(! defined $childPid) {
     slog("Unable to fork process, $!",1);
@@ -299,7 +319,15 @@ sub _forkProcess {
     }
 
     # Delete shared handles as much as possible to avoid race conditions on I/O
-    map {close($_) if(Scalar::Util::openhandle($_))} @autoClosedHandlesForThisFork;
+    foreach my $handleToClose (@autoClosedHandlesForThisFork) {
+      next unless(defined $handleToClose);
+      if(Scalar::Util::openhandle($handleToClose)) {
+        close($handleToClose);
+      }elsif(! $osIsWindows && ref($handleToClose) eq '' && $handleToClose =~ /^\d+$/) {
+        POSIX::close($handleToClose);
+      }
+    }
+    map {POSIX::close($sockets{$_}[2]) if(defined $sockets{$_}[2])} (keys %sockets);
 
     # Remove all internal SimpleEvent data related to parent process
     @autoClosedHandlesForThisFork=();
@@ -351,6 +379,15 @@ sub forkCall {
     return 0;
   }
   my ($p_processFunction,$p_endCallback,$preventQueuing,$r_keptHandles)=@_;
+  if($osIsWindows) {
+    my $codeRefType=ref($p_processFunction);
+    if($codeRefType ne 'CODE') {
+      my $reason=$codeRefType eq '' ? 'not a code reference' : "unsupported code reference type: $codeRefType";
+      slog('Unable to fork function call, '.$reason,1);
+      return 0;
+    }
+  }
+  $p_endCallback=encapsulateCallback($p_endCallback) unless(ref $p_endCallback eq 'CODE');
   my ($inSocket,$outSocket);
   if(! socketpair($inSocket,$outSocket,AF_UNIX,SOCK_STREAM,PF_UNSPEC)) {
     slog("Unable to fork function call, cannot create socketpair: $!",1);
@@ -446,6 +483,7 @@ sub createWin32Process {
   }
   my ($applicationPath,$p_commandParams,$workingDirectory,$p_endCallback,$p_stdRedirections,$preventQueuing)=@_;
   my $originPackage=getOriginPackage();
+  $p_endCallback=encapsulateCallback($p_endCallback,$originPackage) unless(ref $p_endCallback eq 'CODE');
   if((keys %forkedProcesses) + (keys %win32Processes) >= $conf{maxChildProcesses}) {
     if($preventQueuing) {
       slog("Unable to create Win32 process, maximum number of child process ($conf{maxChildProcesses}) is already running",1);
@@ -740,23 +778,78 @@ sub registerSocket {
     return 0;
   }
   my ($socket,$p_readCallback)=@_;
+  my $socketFileno;
+  my $socketBaseRefType=Scalar::Util::reftype($socket);
+  if(defined $socketBaseRefType) {
+    if($socketBaseRefType ne 'GLOB') {
+      if($osIsWindows || ! eval { $socketFileno=$socket->fileno() }) {
+        slog('Unable to register socket, invalid socket type: '.ref($socket),1);
+        return 0;
+      }
+    }
+  }else{
+    if($socket =~ /^\d+$/) {
+      if($osIsWindows) {
+        slog('Unable to register socket: registering socket from file descriptor not supported on Windows',1);
+        return 0;
+      }
+      $socketFileno=$socket;
+    }else{
+      slog("Unable to register socket, unknown socket value: $socket",1);
+      return 0;
+    }
+  }
+  if(defined $socketFileno && $socketFileno != -1) {
+    if($conf{mode} eq 'internal') {
+      if(my $handleFromFd=IO::Handle->new_from_fd($socketFileno,'+<')) {
+        $socket=$handleFromFd;
+      }else{
+        slog("Unable to register socket: $!",1);
+        return 0;
+      }
+    }else{
+      $socket=$socketFileno;
+    }
+  }
   if(exists $sockets{$socket}) {
     slog('Unable to register socket in event loop: this socket has already been registered!',2);
     return 0;
   }
   my $originPackage=getOriginPackage();
+  $p_readCallback=encapsulateCallback($p_readCallback,$originPackage) unless(ref $p_readCallback eq 'CODE');
   if($conf{mode} eq 'internal') {
-    $sockets{$socket}=[$p_readCallback,$originPackage];
+    $sockets{$socket}=[$p_readCallback,$originPackage,$socketFileno];
   }else{
     $sockets{$socket}=[AE::io($socket,0,sub { &{$p_readCallback}($socket); }),$originPackage];
   }
   slog('New socket registered',5);
-  return 1;
+  return defined $socketFileno ? $socket : 1;
 }
 
 sub unregisterSocket {
   my $socket=shift;
   if(! exists $sockets{$socket}) {
+    if(! $osIsWindows) {
+      my $socketFileno;
+      if(ref $socket eq '') {
+        $socketFileno=$socket if($socket =~ /^\d+$/);
+      }else{
+        eval { $socketFileno=$socket->fileno() };
+      }
+      if(defined $socketFileno) {
+        my @socketsToRemove=grep {defined $sockets{$_}[2] && $sockets{$_}[2] == $socketFileno} (keys %sockets);
+        if(@socketsToRemove) {
+          delete @sockets{@socketsToRemove};
+          my $nbSocketsRemoved=scalar @socketsToRemove;
+          if($nbSocketsRemoved < 2) {
+            slog('Socket unregistered',5);
+          }else{
+            slog("$nbSocketsRemoved sockets unregistered",5);
+          }
+          return $nbSocketsRemoved;
+        }
+      }
+    }
     slog('Unable to unregister socket in event loop: unknown socket!',2);
     return 0;
   }
@@ -794,6 +887,7 @@ sub socketGracefulShutdown {
   }
   
   if(defined $r_callback) {
+    $r_callback=encapsulateCallback($r_callback) unless(ref $r_callback eq 'CODE');
     my $timerName='socketGracefulShutdownTimeout#'.Scalar::Util::refaddr($socket);
     addTimer($timerName,
              $timeout,
@@ -906,6 +1000,7 @@ sub registerSignal {
     return 0;
   }
   my $originPackage=getOriginPackage();
+  $p_signalCallback=encapsulateCallback($p_signalCallback,$originPackage) unless(ref $p_signalCallback eq 'CODE');
   if($conf{mode} eq 'internal') {
     $SIG{$signal}=$p_signalCallback;
     $signals{$signal}=[$p_signalCallback,$originPackage];
@@ -940,6 +1035,7 @@ sub addTimer {
   }
   slog("Adding timer \"$name\" (delay:$delay, interval:$interval)",5);
   my $originPackage=getOriginPackage();
+  $p_callback=encapsulateCallback($p_callback,$originPackage) unless(ref $p_callback eq 'CODE');
   if($conf{mode} eq 'internal') {
     $timers{$name}=[{nextRun => Time::HiRes::time+$delay, interval => $interval, callback => $p_callback},$originPackage];
   }else{
@@ -1005,7 +1101,7 @@ sub isInternalCallback {
   my ($calledFunc,$callerFunc)=@_;
   return 0 unless(defined $calledFunc && defined $callerFunc);
   foreach my $func ($calledFunc,$callerFunc) {
-    return 0 unless(index($func,$INTERNAL_PACKAGE_PREFIX) == 0);
+    return 0 unless(rindex($func,$INTERNAL_PACKAGE_PREFIX,0) == 0);
     substr($func,0,$INTERNAL_PACKAGE_PREFIX_LENGTH,'');
   }
   return 1 if(exists $INTERNAL_CALLBACKS{$calledFunc} && exists $INTERNAL_CALLBACKS{$calledFunc}{$callerFunc});
@@ -1013,13 +1109,20 @@ sub isInternalCallback {
 }
 
 sub getOriginPackage {
-  return __PACKAGE__ if(isInternalCallback((caller(1))[3],(caller(2))[3]));
-  my $nestLevel=1;
+  my $skippedNestLevel=shift//0;
+  return __PACKAGE__ if(isInternalCallback((caller(1+$skippedNestLevel))[3],(caller(2+$skippedNestLevel))[3]));
+  my $nestLevel=1+$skippedNestLevel;
   while(my $callerPackage=caller($nestLevel++)) {
-    next if($callerPackage eq __PACKAGE__ || exists $proxyPackages{$callerPackage});
+    next if($callerPackage eq __PACKAGE__ || exists $proxyPackages{$callerPackage} || (any {rindex($callerPackage,$_.'::',0)==0} (keys %proxyPackages)));
     return $callerPackage;
   }
   return '_UNKNWON_';
+}
+
+sub encapsulateCallback {
+  my ($r_cb,$originPackage)=@_;
+  $originPackage//=getOriginPackage(1);
+  return eval("package $originPackage; sub { \&{\$r_cb}(\@_); }");
 }
 
 sub removeAllCallbacks {
