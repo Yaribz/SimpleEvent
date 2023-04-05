@@ -22,6 +22,7 @@ package SimpleEvent;
 use strict;
 use warnings;
 
+use Fcntl 'LOCK_NB';
 use File::Spec::Functions qw'devnull';
 use IO::Select;
 use List::Util qw'first sum0';
@@ -34,7 +35,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.10';
+my $moduleVersion='0.11';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -58,6 +59,7 @@ my %signals;
 my %sockets; tie %sockets, 'Tie::RefHash';
 my $r_autoClosedHandles;
 my %timers;
+my %fileLockRequests;
 my $endLoopCondition;
 my %proxyPackages;
 
@@ -146,6 +148,7 @@ sub getNbQueuedProcesses { return scalar @queuedProcesses; }
 sub getNbSignals { return scalar %signals; }
 sub getNbSockets { return scalar(keys %sockets); }
 sub getNbTimers { return scalar %timers; }
+sub getNbFileLockRequests { return scalar %fileLockRequests }
 
 sub startLoop {
   my $p_cleanUpFunction=shift;
@@ -155,11 +158,13 @@ sub startLoop {
   }
   slog('Starting event loop...',3);
   if($conf{mode} eq 'AnyEvent') {
-    my $processManagerTimer=AE::timer(0,$conf{timeSlice},\&_manageProcesses);
+    my $processAndLockManagementTimer=AE::timer(0,$conf{timeSlice},sub {_manageProcesses();_checkFileLockRequests();});
     $endLoopCondition->recv();
   }else{
     while(! $endLoopCondition) {
       _checkSimpleTimers();
+      last if($endLoopCondition);
+      _checkFileLockRequests();
       last if($endLoopCondition);
       _checkSimpleSockets();
       last if($endLoopCondition);
@@ -173,16 +178,18 @@ sub startLoop {
     my @remainingSignals=keys %signals;
     my @remainingSockets=keys %sockets;
     my @remainingTimers=keys %timers;
-    &{$p_cleanUpFunction}(\@remainingPids,\@remainingWin32Processes,\@queuedProcesses,\@remainingSignals,\@remainingSockets,\@remainingTimers);
+    my @remainingFileLockRequests=keys %fileLockRequests;
+    &{$p_cleanUpFunction}(\@remainingPids,\@remainingWin32Processes,\@queuedProcesses,\@remainingSignals,\@remainingSockets,\@remainingTimers,\@remainingFileLockRequests);
   }
   my ($nbRemainingForkedProcesses,$nbRemainingWin32Processes,$nbQueuedProcesses)=(scalar keys %forkedProcesses,scalar keys %win32Processes,getNbQueuedProcesses());
-  my ($nbRemainingSignals,$nbRemainingSockets,$nbRemainingTimers)=(getNbSignals(),getNbSockets(),getNbTimers());
+  my ($nbRemainingSignals,$nbRemainingSockets,$nbRemainingTimers,$nbRemainingFileLockRequests)=(getNbSignals(),getNbSockets(),getNbTimers(),getNbFileLockRequests());
   slog("$nbRemainingForkedProcesses forked process".($nbRemainingForkedProcesses>1?'es are':' is').' still running',2) if($nbRemainingForkedProcesses);
   slog("$nbRemainingWin32Processes Win32 process".($nbRemainingWin32Processes>1?'es are':' is').' still running',2) if($nbRemainingWin32Processes);
   slog("$nbQueuedProcesses process".($nbQueuedProcesses>1?'es are':' is').' still queued',2) if($nbQueuedProcesses);
   slog("$nbRemainingSignals signal handler".($nbRemainingSignals>1?'s are':' is').' still registered',2) if($nbRemainingSignals);
   slog("$nbRemainingSockets socket".($nbRemainingSockets>1?'s are':' is').' still registered',2) if($nbRemainingSockets);
   slog("$nbRemainingTimers timer".($nbRemainingTimers>1?'s are':' is').' still registered',2) if($nbRemainingTimers);
+  slog("$nbRemainingFileLockRequests file lock request".($nbRemainingFileLockRequests>1?'s are':' is').' still registered',2) if($nbRemainingFileLockRequests);
 }
 
 sub stopLoop {
@@ -341,6 +348,7 @@ sub _forkProcess {
     %sockets=();
     $r_autoClosedHandles=undef;
     %timers=();
+    %fileLockRequests=();
 
     # Call the child process function
     &{$p_processFunction}();
@@ -1071,6 +1079,83 @@ sub _checkSimpleTimers {
   }
 }
 
+sub requestFileLock {
+  my ($name,$file,$mode,$r_callback,$timeout,$r_timeoutCallback)=@_;
+  if(! defined $endLoopCondition) {
+    slog("Unable to process file lock request \"$name\", event loop is uninitialized",1);
+    return 0;
+  }
+  if(exists $fileLockRequests{$name}) {
+    slog("Unable to process file lock request \"$name\": this file lock request is already in progress!",2);
+    return 0;
+  }
+  my $originPackage=getOriginPackage();
+  $r_callback=encapsulateCallback($r_callback,$originPackage) unless(ref $r_callback eq 'CODE');
+  if(open(my $lockHdl,'>',$file)) {
+    if(flock($lockHdl,$mode | LOCK_NB)) {
+      slog("File lock request \"$name\" processed directly (file:$file, mode:$mode".($timeout?", timeout:$timeout":'').')',5);
+      $r_callback->($lockHdl);
+      return 1;
+    }else{
+      close($lockHdl);
+    }
+  }else{
+    slog("Unable to process file lock request \"$name\": could not open file \"$file\" for writing",2);
+    return 0;
+  }
+  my $timeoutTimer;
+  if($timeout) {
+    $timeoutTimer='fileLockRequestTimeout('.$name.')';
+    $r_timeoutCallback=encapsulateCallback($r_timeoutCallback,$originPackage) if(defined $r_timeoutCallback && ref $r_timeoutCallback ne 'CODE');
+    addTimer($timeoutTimer,
+             $timeout,
+             0,
+             sub {
+               delete $fileLockRequests{$name};
+               slog("Removing file lock request \"$name\" (timeout)",5);
+               $r_timeoutCallback->($name) if(defined $r_timeoutCallback);
+             });
+  }
+  slog("File lock request \"$name\" queued for retry (file:$file, mode:$mode".($timeout?", timeout:$timeout":'').')',5);
+  $fileLockRequests{$name}=[{file => $file,
+                             mode => $mode,
+                             callback => $r_callback,
+                             timeoutTimer => $timeoutTimer},
+                            $originPackage];
+  return 1;
+}
+
+sub removeFileLockRequest {
+  my $name=shift;
+  my $r_req=delete $fileLockRequests{$name};
+  if(! defined $r_req) {
+    slog("Unable to remove file lock request \"$name\": unknown file lock request!",2);
+    return 0;
+  }
+  slog("Removing file lock request \"$name\"",5);
+  my $timeoutTimer=$r_req->[0]{timeoutTimer};
+  removeTimer($timeoutTimer) if(defined $timeoutTimer && exists $timers{$timeoutTimer});
+  return 1;
+}
+
+sub _checkFileLockRequests {
+  foreach my $requestName (keys %fileLockRequests) {
+    my $r_req=$fileLockRequests{$requestName};
+    next unless(defined $r_req); # file lock requests can be removed by forked process exit callbacks at any time (linux), or by any other file lock request callback
+    if(open(my $lockHdl,'>',$r_req->[0]{file})) {
+      if(flock($lockHdl,$r_req->[0]{mode} | LOCK_NB)) {
+        removeFileLockRequest($requestName);
+        $r_req->[0]{callback}->($lockHdl,$requestName);
+        next;
+      }else{
+        close($lockHdl);
+      }
+    }else{
+      slog("Unable to process file lock request \"$requestName\" (retry): could not open file \"$r_req->[0]{file}\" for writing",5);
+    }
+  }
+}
+
 sub addProxyPackage {
   my $packageName=shift;
   if(exists $proxyPackages{$packageName}) {
@@ -1094,7 +1179,8 @@ sub removeProxyPackage {
 }
 
 my %INTERNAL_CALLBACKS=(forkProcess => { createDetachedProcess => 1 },
-                        registerSocket => { forkCall => 1 });
+                        registerSocket => { forkCall => 1 },
+                        addTimer => { requestFileLock => 1} );
 my $INTERNAL_PACKAGE_PREFIX=__PACKAGE__.'::';
 my $INTERNAL_PACKAGE_PREFIX_LENGTH=length($INTERNAL_PACKAGE_PREFIX);
 sub isInternalCallback {
@@ -1128,7 +1214,7 @@ sub encapsulateCallback {
 sub removeAllCallbacks {
   my ($callbackType,$originPackage)=@_;
   $originPackage//=getOriginPackage();
-  my @knownCallbackTypes=('processes','signals','sockets','timers');
+  my @knownCallbackTypes=('processes','signals','sockets','timers','fileLockRequests');
   if(defined $callbackType && (none {$callbackType eq $_} @knownCallbackTypes)) {
     slog("Invalid call to removeAllCallbacks function: unknown callback type \"$callbackType\"",1);
     return undef;
@@ -1160,6 +1246,10 @@ sub removeAllCallbacks {
     }elsif($type eq 'timers') {
       my @timersToRemove=grep {$timers{$_}[1] eq $originPackage} (keys %timers);
       my @removeResults=map {removeTimer($_)} @timersToRemove;
+      $nbRemovedCallbacks+=sum0(@removeResults);
+    }elsif($type eq 'fileLockRequests') {
+      my @fileLockRequestsToRemove=grep {$fileLockRequests{$_}[1] eq $originPackage} (keys %fileLockRequests);
+      my @removeResults=map {removeFileLockRequest($_)} @fileLockRequestsToRemove;
       $nbRemovedCallbacks+=sum0(@removeResults);
     }
   }
@@ -1218,6 +1308,12 @@ sub _debug {
     $sep=1;
     print "timers:\n";
     print Dumper(\%timers);
+  }
+  if(%fileLockRequests) {
+    print +('-' x 40)."\n" if($sep);
+    $sep=1;
+    print "fileLockRequests:\n";
+    print Dumper(\%fileLockRequests);
   }
   print +('#' x 79)."\n";
 }
