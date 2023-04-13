@@ -42,3 +42,4 @@ SimpleEvent.pm:
       support registering/unregistering sockets from non-GLOB objects as long as they implement the "fileno" function (Linux)
       all sub-packages of proxy packages are now also considered as being proxy packages
 0.11: add support for asynchronous file lock requests
+0.12: added workaround for AnyEvent::TLS module not being thread safe

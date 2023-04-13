@@ -1,7 +1,7 @@
 # A Perl module implementing a basic asynchronous event functionality compatible
 # with AnyEvent
 #
-# Copyright (C) 2008-2020  Yann Riou <yaribzh@gmail.com>
+# Copyright (C) 2008-2023  Yann Riou <yaribzh@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -35,7 +35,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.11';
+my $moduleVersion='0.12';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -251,7 +251,7 @@ sub forkProcess {
   return _forkProcess($p_processFunction,$p_endCallback,undef,$r_keptHandles,$originPackage);
 }
 
-my $inlinePythonWorkaroundDone;
+my ($inlinePythonWorkaroundDone,$anyeventTlsWorkaroundDone);
 sub _forkProcess {
   my ($p_processFunction,$p_endCallback,$procHandle,$r_keptHandles,$originPackage)=@_;
   my @autoClosedHandlesForThisFork;
@@ -289,6 +289,12 @@ sub _forkProcess {
     ${Inline::Python::Function::}{CLONE_SKIP}=sub {1};
     ${Inline::Python::Boolean::}{CLONE_SKIP}=sub {1};
     $inlinePythonWorkaroundDone=1;
+  }
+
+  # Workaround for AnyEvent::TLS not being thread safe (AnyEvent::TLS::_put_session($$) and AnyEvent::TLS::DESTROY())
+  if(! $anyeventTlsWorkaroundDone && defined ${AnyEvent::TLS::}{VERSION}) {
+    ${AnyEvent::TLS::}{CLONE_SKIP}=sub {1};
+    $anyeventTlsWorkaroundDone=1;
   }
   
   my $childPid = fork();
