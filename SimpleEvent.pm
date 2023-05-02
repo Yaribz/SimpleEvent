@@ -35,7 +35,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.12';
+my $moduleVersion='0.13';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -112,27 +112,15 @@ sub init {
     ${Win32::Process::}{CLONE_SKIP}=sub{1}; # Workaround for Win32::Process not being thread-safe
   }
 
+  my $eventModel;
   if($conf{mode} eq 'AnyEvent') {
-    if($osIsWindows) {
-      if(exists $::{'EV::'}) {
-        slog('The AnyEvent module cannot be used with the EV library on Windows system',1);
-        return 0;
-      }
-      while(defined (my $eventModelIdx = first {$AnyEvent::models[$_][1] eq 'AnyEvent::Impl::EV'} (0..$#AnyEvent::models))) {
-        splice(@AnyEvent::models,$eventModelIdx,1);
-      }
-    }
-    my $anyEventModel=AnyEvent::detect();
-    slog("Event loop initialized using model $anyEventModel (time slice: ".($conf{timeSlice}*1000).'ms)',3);
-    if($osIsWindows && $anyEventModel eq 'AnyEvent::Impl::EV') {
-      slog('The AnyEvent module cannot be used with the EV library on Windows system',1);
-      return 0;
-    }
+    $eventModel=AnyEvent::detect();
     $endLoopCondition=AE::cv();
   }else{
-    slog('Event loop initialized using internal model (time slice: '.($conf{timeSlice}*1000).'ms)',3);
+    $eventModel='internal';
     $endLoopCondition=0;
   }
+  slog("Event loop initialized using $eventModel model (time slice: ".($conf{timeSlice}*1000).'ms)',3);
 
   return 1;
 }
@@ -251,7 +239,7 @@ sub forkProcess {
   return _forkProcess($p_processFunction,$p_endCallback,undef,$r_keptHandles,$originPackage);
 }
 
-my ($inlinePythonWorkaroundDone,$anyeventTlsWorkaroundDone);
+my ($inlinePythonWorkaroundDone,$anyeventTlsWorkaroundDone,$libEvWorkaroundDone);
 sub _forkProcess {
   my ($p_processFunction,$p_endCallback,$procHandle,$r_keptHandles,$originPackage)=@_;
   my @autoClosedHandlesForThisFork;
@@ -283,7 +271,7 @@ sub _forkProcess {
   }
 
   # Workaround for Inline::Python not being thread safe
-  if(! $inlinePythonWorkaroundDone && ${Inline::Python::}{VERSION}) {
+  if(! $inlinePythonWorkaroundDone && defined $Inline::Python::VERSION) {
     ${Inline::Python::Object::}{CLONE_SKIP}=sub {1};
     ${Inline::Python::Object::Data::}{CLONE_SKIP}=sub {1};
     ${Inline::Python::Function::}{CLONE_SKIP}=sub {1};
@@ -292,9 +280,15 @@ sub _forkProcess {
   }
 
   # Workaround for AnyEvent::TLS not being thread safe (AnyEvent::TLS::_put_session($$) and AnyEvent::TLS::DESTROY())
-  if(! $anyeventTlsWorkaroundDone && defined ${AnyEvent::TLS::}{VERSION}) {
+  if(! $anyeventTlsWorkaroundDone && defined $AnyEvent::TLS::VERSION) {
     ${AnyEvent::TLS::}{CLONE_SKIP}=sub {1};
     $anyeventTlsWorkaroundDone=1;
+  }
+  
+  # Workaround for EV not being thread safe
+  if(! $libEvWorkaroundDone && defined $EV::VERSION) {
+    map {${EV::}{$_}{CLONE_SKIP}=sub {1} if(defined *{${EV::}{$_}}{HASH})} (keys %EV::);
+    $libEvWorkaroundDone=1;
   }
   
   my $childPid = fork();

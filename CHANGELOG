@@ -43,3 +43,4 @@ SimpleEvent.pm:
       all sub-packages of proxy packages are now also considered as being proxy packages
 0.11: add support for asynchronous file lock requests
 0.12: added workaround for AnyEvent::TLS module not being thread safe
+0.13: added workaround for EV module not being thread safe (it is now possible to use libev on Windows)
