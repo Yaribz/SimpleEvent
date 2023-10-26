@@ -35,7 +35,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.13';
+my $moduleVersion='0.14';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -60,6 +60,7 @@ my %sockets; tie %sockets, 'Tie::RefHash';
 my $r_autoClosedHandles;
 my %timers;
 my %fileLockRequests;
+my %forkedProcessCallbacks;
 my $endLoopCondition;
 my %proxyPackages;
 
@@ -107,8 +108,9 @@ sub init {
   $SIG{CHLD} = sub { local ($!, $?); _reapForkedProcesses(); } if(! $osIsWindows && $conf{mode} eq 'internal');
 
   if($osIsWindows) {
-    eval "use Win32";
-    eval "use Win32::Process";
+    eval 'use Win32';
+    eval 'use Win32::Process';
+    eval 'use Win32API::File';
     ${Win32::Process::}{CLONE_SKIP}=sub{1}; # Workaround for Win32::Process not being thread-safe
   }
 
@@ -137,6 +139,7 @@ sub getNbSignals { return scalar %signals; }
 sub getNbSockets { return scalar(keys %sockets); }
 sub getNbTimers { return scalar %timers; }
 sub getNbFileLockRequests { return scalar %fileLockRequests }
+sub getNbForkedProcessCallbacks { return scalar %forkedProcessCallbacks }
 
 sub startLoop {
   my $p_cleanUpFunction=shift;
@@ -167,10 +170,12 @@ sub startLoop {
     my @remainingSockets=keys %sockets;
     my @remainingTimers=keys %timers;
     my @remainingFileLockRequests=keys %fileLockRequests;
-    &{$p_cleanUpFunction}(\@remainingPids,\@remainingWin32Processes,\@queuedProcesses,\@remainingSignals,\@remainingSockets,\@remainingTimers,\@remainingFileLockRequests);
+    my @remainingForkedProcessCallbacks=keys %forkedProcessCallbacks;
+    &{$p_cleanUpFunction}(\@remainingPids,\@remainingWin32Processes,\@queuedProcesses,\@remainingSignals,\@remainingSockets,\@remainingTimers,\@remainingFileLockRequests,\@remainingForkedProcessCallbacks);
   }
   my ($nbRemainingForkedProcesses,$nbRemainingWin32Processes,$nbQueuedProcesses)=(scalar keys %forkedProcesses,scalar keys %win32Processes,getNbQueuedProcesses());
   my ($nbRemainingSignals,$nbRemainingSockets,$nbRemainingTimers,$nbRemainingFileLockRequests)=(getNbSignals(),getNbSockets(),getNbTimers(),getNbFileLockRequests());
+  my $nbForkedProcessCallbacks=getNbForkedProcessCallbacks();
   slog("$nbRemainingForkedProcesses forked process".($nbRemainingForkedProcesses>1?'es are':' is').' still running',2) if($nbRemainingForkedProcesses);
   slog("$nbRemainingWin32Processes Win32 process".($nbRemainingWin32Processes>1?'es are':' is').' still running',2) if($nbRemainingWin32Processes);
   slog("$nbQueuedProcesses process".($nbQueuedProcesses>1?'es are':' is').' still queued',2) if($nbQueuedProcesses);
@@ -178,6 +183,7 @@ sub startLoop {
   slog("$nbRemainingSockets socket".($nbRemainingSockets>1?'s are':' is').' still registered',2) if($nbRemainingSockets);
   slog("$nbRemainingTimers timer".($nbRemainingTimers>1?'s are':' is').' still registered',2) if($nbRemainingTimers);
   slog("$nbRemainingFileLockRequests file lock request".($nbRemainingFileLockRequests>1?'s are':' is').' still registered',2) if($nbRemainingFileLockRequests);
+  slog("$nbForkedProcessCallbacks forked process callback".($nbForkedProcessCallbacks>1?'s are':' is').' still registered',2) if($nbForkedProcessCallbacks);
 }
 
 sub stopLoop {
@@ -306,6 +312,8 @@ sub _forkProcess {
   if($childPid == 0) {
     local $SIG{CHLD};
 
+    map {$forkedProcessCallbacks{$_}[0]->()} (sort keys %forkedProcessCallbacks);
+    
     # Workaround for IO::Socket::SSL misbehaving with fork()
     foreach my $r_possibleIoSocketSslHandle (@{$r_autoClosedHandles},keys %sockets) {
       my ($r_handle,$handleRefType) = ($r_possibleIoSocketSslHandle,ref($r_possibleIoSocketSslHandle));
@@ -349,6 +357,7 @@ sub _forkProcess {
     $r_autoClosedHandles=undef;
     %timers=();
     %fileLockRequests=();
+    %forkedProcessCallbacks=();
 
     # Call the child process function
     &{$p_processFunction}();
@@ -831,6 +840,7 @@ sub registerSocket {
     $sockets{$socket}=[AE::io($socket,0,sub { &{$p_readCallback}($socket); }),$originPackage];
   }
   slog('New socket registered',5);
+  win32HdlDisableInheritance($socket) if($osIsWindows);
   return defined $socketFileno ? $socket : 1;
 }
 
@@ -981,6 +991,20 @@ sub removeAutoCloseOnFork {
   return $rc;
 }
 
+sub win32HdlDisableInheritance {
+  my $winHdl=Win32API::File::GetOsFHandle(shift);
+  if($winHdl == Win32API::File::INVALID_HANDLE_VALUE()) {
+    slog('Unable to retrieve Windows handle to disable inheritance: '.$^E,2);
+    return 0;
+  }
+  if(Win32API::File::SetHandleInformation($winHdl,Win32API::File::HANDLE_FLAG_INHERIT(),0)) {
+    return 1;
+  }else{
+    slog('Unable to disable Windows handle inheritance: '.$^E,2);
+    return 0;
+  }
+}
+
 sub _checkSimpleSockets {
   if(%sockets) {
     my @pendingSockets=IO::Select->new(keys %sockets)->can_read($conf{timeSlice});
@@ -1077,6 +1101,30 @@ sub _checkSimpleTimers {
       }
     }
   }
+}
+
+sub addForkedProcessCallback {
+  my ($name,$r_callback)=@_;
+  if(exists $forkedProcessCallbacks{$name}) {
+    slog("Unable to add forked process callback \"$name\": duplicate forked process callback name!",2);
+    return 0;
+  }
+  slog("Adding forked process callback \"$name\"",5);
+  my $originPackage=getOriginPackage();
+  $r_callback=encapsulateCallback($r_callback,$originPackage) unless(ref $r_callback eq 'CODE');
+  $forkedProcessCallbacks{$name}=[$r_callback,$originPackage];
+  return 1;
+}
+
+sub removeForkedProcessCallback {
+  my $name=shift;
+  my $r_fpcb=delete $forkedProcessCallbacks{$name};
+  if(! defined $r_fpcb) {
+    slog("Unable to remove forked process callback \"$name\": unknown forked process callback name!",2);
+    return 0;
+  }
+  slog("Removing forked process callback \"$name\"",5);
+  return 1;
 }
 
 sub requestFileLock {
@@ -1214,7 +1262,7 @@ sub encapsulateCallback {
 sub removeAllCallbacks {
   my ($callbackType,$originPackage)=@_;
   $originPackage//=getOriginPackage();
-  my @knownCallbackTypes=('processes','signals','sockets','timers','fileLockRequests');
+  my @knownCallbackTypes=('processes','signals','sockets','timers','fileLockRequests','forkedProcessCallbacks');
   if(defined $callbackType && (none {$callbackType eq $_} @knownCallbackTypes)) {
     slog("Invalid call to removeAllCallbacks function: unknown callback type \"$callbackType\"",1);
     return undef;
@@ -1250,6 +1298,10 @@ sub removeAllCallbacks {
     }elsif($type eq 'fileLockRequests') {
       my @fileLockRequestsToRemove=grep {$fileLockRequests{$_}[1] eq $originPackage} (keys %fileLockRequests);
       my @removeResults=map {removeFileLockRequest($_)} @fileLockRequestsToRemove;
+      $nbRemovedCallbacks+=sum0(@removeResults);
+    }elsif($type eq 'forkedProcessCallbacks') {
+      my @forkedProcessCallbacksToRemove=grep {$forkedProcessCallbacks{$_}[1] eq $originPackage} (keys %forkedProcessCallbacks);
+      my @removeResults=map {removeForkedProcessCallback($_)} @forkedProcessCallbacksToRemove;
       $nbRemovedCallbacks+=sum0(@removeResults);
     }
   }
@@ -1314,6 +1366,12 @@ sub _debug {
     $sep=1;
     print "fileLockRequests:\n";
     print Dumper(\%fileLockRequests);
+  }
+  if(%forkedProcessCallbacks) {
+    print +('-' x 40)."\n" if($sep);
+    $sep=1;
+    print "forkedProcessCallbacks:\n";
+    print Dumper(\%forkedProcessCallbacks);
   }
   print +('#' x 79)."\n";
 }

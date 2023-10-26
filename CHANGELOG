@@ -44,3 +44,6 @@ SimpleEvent.pm:
 0.11: add support for asynchronous file lock requests
 0.12: added workaround for AnyEvent::TLS module not being thread safe
 0.13: added workaround for EV module not being thread safe (it is now possible to use libev on Windows)
+0.14: add forked process callback functionality (callback executed at start of all forked processes)
+      new function "win32HdlDisableInheritance": prevent handle from being automatically inherited by subprocesses (Windows)
+      sockets registered with "registerSocket" are no longer automatically inherited by subprocesses (Windows)
