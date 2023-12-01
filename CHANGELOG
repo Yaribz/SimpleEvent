@@ -47,3 +47,4 @@ SimpleEvent.pm:
 0.14: add forked process callback functionality (callback executed at start of all forked processes)
       new function "win32HdlDisableInheritance": prevent handle from being automatically inherited by subprocesses (Windows)
       sockets registered with "registerSocket" are no longer automatically inherited by subprocesses (Windows)
+0.15: lock file handles retrieved with "requestFileLock" are no longer automatically inherited by subprocesses (Windows)

@@ -35,7 +35,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.14';
+my $moduleVersion='0.15';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -1141,6 +1141,7 @@ sub requestFileLock {
   $r_callback=encapsulateCallback($r_callback,$originPackage) unless(ref $r_callback eq 'CODE');
   if(open(my $lockHdl,'>',$file)) {
     if(flock($lockHdl,$mode | LOCK_NB)) {
+      win32HdlDisableInheritance($lockHdl) if($osIsWindows);
       slog("File lock request \"$name\" processed directly (file:$file, mode:$mode".($timeout?", timeout:$timeout":'').')',5);
       $r_callback->($lockHdl);
       return 1;
@@ -1192,6 +1193,7 @@ sub _checkFileLockRequests {
     next unless(defined $r_req); # file lock requests can be removed by forked process exit callbacks at any time (linux), or by any other file lock request callback
     if(open(my $lockHdl,'>',$r_req->[0]{file})) {
       if(flock($lockHdl,$r_req->[0]{mode} | LOCK_NB)) {
+        win32HdlDisableInheritance($lockHdl) if($osIsWindows);
         removeFileLockRequest($requestName);
         $r_req->[0]{callback}->($lockHdl,$requestName);
         next;
