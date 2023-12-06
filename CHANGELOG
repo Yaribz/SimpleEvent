@@ -48,3 +48,4 @@ SimpleEvent.pm:
       new function "win32HdlDisableInheritance": prevent handle from being automatically inherited by subprocesses (Windows)
       sockets registered with "registerSocket" are no longer automatically inherited by subprocesses (Windows)
 0.15: lock file handles retrieved with "requestFileLock" are no longer automatically inherited by subprocesses (Windows)
+0.16: internal sockets created automatically for IPC when forkCall is called are no longer inherited by subprocesses (Windows)

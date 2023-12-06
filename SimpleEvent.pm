@@ -35,7 +35,7 @@ use Time::HiRes;
 
 use SimpleLog;
 
-my $moduleVersion='0.15';
+my $moduleVersion='0.16';
 
 sub any (&@) { my $c = shift; return defined first {&$c} @_; }
 sub all (&@) { my $c = shift; return ! defined first {! &$c} @_; }
@@ -409,6 +409,10 @@ sub forkCall {
   if(! socketpair($inSocket,$outSocket,AF_UNIX,SOCK_STREAM,PF_UNSPEC)) {
     slog("Unable to fork function call, cannot create socketpair: $!",1);
     return 0;
+  }
+  if($osIsWindows) {
+    win32HdlDisableInheritance($inSocket);
+    win32HdlDisableInheritance($outSocket);
   }
   my ($readResultStatus,$readResultData)=(-1);
   my ($forkResult,$procHandle);($forkResult,$procHandle) = forkProcess(
